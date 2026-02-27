@@ -1,39 +1,43 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec — school bell bot Windows single-file build
+# PyInstaller spec -- school bell bot Windows single-file build
 
 import importlib
 import os
+import glob
 from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs
 
 # -- Collect PyNaCl native binaries --
 nacl_datas, nacl_binaries, nacl_hiddenimports = collect_all('nacl')
 nacl_binaries += collect_dynamic_libs('nacl')
 
-# Explicitly find _sodium.pyd and co-located DLLs
-try:
-    _nacl_mod = importlib.import_module('nacl._sodium')
-    _sodium_path = _nacl_mod.__file__
-    if _sodium_path:
-        nacl_binaries.append((_sodium_path, 'nacl'))
-        print(f"[spec] found _sodium: {_sodium_path}")
-        _nacl_dir = os.path.dirname(_sodium_path)
-        for f in os.listdir(_nacl_dir):
-            if f.endswith(('.dll', '.pyd')) and f != os.path.basename(_sodium_path):
-                full = os.path.join(_nacl_dir, f)
-                nacl_binaries.append((full, 'nacl'))
-                print(f"[spec] found extra binary: {full}")
-        _libs_dir = os.path.join(_nacl_dir, '.libs')
-        if os.path.isdir(_libs_dir):
-            for f in os.listdir(_libs_dir):
-                if f.endswith('.dll'):
-                    full = os.path.join(_libs_dir, f)
-                    nacl_binaries.append((full, '.'))
-                    print(f"[spec] found .libs dll: {full}")
-except Exception as e:
-    print(f"[spec] WARNING: nacl._sodium import failed: {e}")
+# Find nacl package directory
+_nacl_pkg = importlib.import_module('nacl')
+_nacl_pkg_dir = os.path.dirname(_nacl_pkg.__file__)
+_site_packages = os.path.dirname(_nacl_pkg_dir)
 
-print(f"[spec] nacl_binaries count: {len(nacl_binaries)}")
-print(f"[spec] nacl_hiddenimports count: {len(nacl_hiddenimports)}")
+# 1) nacl.libs/ directory (delvewheel style, next to nacl/ in site-packages)
+_nacl_libs = os.path.join(_site_packages, 'nacl.libs')
+if os.path.isdir(_nacl_libs):
+    for f in os.listdir(_nacl_libs):
+        if f.endswith('.dll'):
+            full = os.path.join(_nacl_libs, f)
+            nacl_binaries.append((full, '.'))
+            print(f"[spec] nacl.libs dll: {full}")
+else:
+    print(f"[spec] nacl.libs dir not found at: {_nacl_libs}")
+
+# 2) .pyd files inside nacl/ package
+for f in glob.glob(os.path.join(_nacl_pkg_dir, '**', '*.pyd'), recursive=True):
+    rel = os.path.relpath(os.path.dirname(f), _site_packages)
+    nacl_binaries.append((f, rel))
+    print(f"[spec] nacl pyd: {f} -> {rel}")
+
+# 3) Any DLLs directly inside nacl/ package
+for f in glob.glob(os.path.join(_nacl_pkg_dir, '**', '*.dll'), recursive=True):
+    nacl_binaries.append((f, '.'))
+    print(f"[spec] nacl dll: {f}")
+
+print(f"[spec] total nacl_binaries: {len(nacl_binaries)}")
 
 a = Analysis(
     ["bot.py"],
