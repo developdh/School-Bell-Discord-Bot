@@ -12,6 +12,38 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# ── PyNaCl debug (frozen exe) ────────────────────────────────────────────────
+if getattr(sys, "frozen", False):
+    _mp = sys._MEIPASS
+    print(f"[DIAG] _MEIPASS: {_mp}")
+    # list nacl/sodium related files in bundle
+    for root, dirs, files in os.walk(_mp):
+        for f in files:
+            if "nacl" in f.lower() or "sodium" in f.lower():
+                print(f"[DIAG] file: {os.path.join(root, f)}")
+    # test nacl import chain
+    try:
+        import nacl
+        print(f"[DIAG] nacl OK: {nacl.__file__}")
+    except Exception as e:
+        print(f"[DIAG] nacl FAIL: {e}")
+    try:
+        import nacl._sodium
+        print(f"[DIAG] nacl._sodium OK: {nacl._sodium.__file__}")
+    except Exception as e:
+        print(f"[DIAG] nacl._sodium FAIL: {e}")
+    try:
+        import nacl.secret
+        print(f"[DIAG] nacl.secret OK")
+    except Exception as e:
+        print(f"[DIAG] nacl.secret FAIL: {e}")
+    try:
+        import nacl.utils
+        print(f"[DIAG] nacl.utils OK")
+    except Exception as e:
+        print(f"[DIAG] nacl.utils FAIL: {e}")
+# ─────────────────────────────────────────────────────────────────────────────
+
 import discord
 
 # ── Frozen(PyInstaller) 실행 여부 감지 ────────────────────────────────────────
