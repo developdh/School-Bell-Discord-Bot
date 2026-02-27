@@ -1,0 +1,22 @@
+# 환경변수
+.env
+
+# 상태 파일
+state.json
+
+# TTS 캐시
+tts_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# 로그
+*.log
+
+# macOS
+.DS_Store
