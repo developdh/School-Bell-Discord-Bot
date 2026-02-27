@@ -1,35 +1,35 @@
 name: Build Windows EXE
 
 on:
-  workflow_dispatch:       # 수동 실행 (GitHub → Actions 탭에서 "Run workflow" 버튼)
+  workflow_dispatch:
   push:
     tags:
-      - "v*"               # v1.0 같은 태그 푸시 시 자동 빌드
+      - "v*"
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      - name: 소스 체크아웃
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Python 설정
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: 패키지 설치
+      - name: Install packages
         run: pip install pyinstaller "discord.py[voice]" edge-tts gTTS python-dotenv tzdata
 
-      - name: PyNaCl 설치 확인
+      - name: Verify PyNaCl
         run: |
-          python -c "import nacl; print('nacl location:', nacl.__file__)"
-          python -c "import nacl._sodium; print('_sodium location:', nacl._sodium.__file__)"
-          python -c "import nacl.secret; import nacl.utils; print('nacl.secret + nacl.utils OK')"
-          python -c "import os, nacl; d=os.path.dirname(nacl.__file__); [print(f'  {root}/{f}') for root,_,files in os.walk(d) for f in files if f.endswith(('.pyd','.dll','.so'))]"
+          python -c "import nacl; print('nacl:', nacl.__file__)"
+          python -c "import nacl._sodium; print('_sodium:', nacl._sodium.__file__)"
+          python -c "import nacl.secret; import nacl.utils; print('voice deps OK')"
+          python -c "import os,nacl; d=os.path.dirname(nacl.__file__); [print(f'  {root}/{f}') for root,_,files in os.walk(d) for f in files if f.endswith(('.pyd','.dll','.so'))]"
 
-      - name: ffmpeg 다운로드
+      - name: Download ffmpeg
         shell: pwsh
         run: |
           $url = "https://github.com/BtbN/ffmpeg-builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
@@ -40,36 +40,12 @@ jobs:
           Copy-Item $ffmpeg.FullName -Destination "ffmpeg.exe"
           Remove-Item -Recurse -Force "ffmpeg_tmp", "ffmpeg.zip"
 
-      - name: PyInstaller 빌드
-        run: pyinstaller school_bell.spec --clean --log-level DEBUG 2>&1 | tee build.log
+      - name: Build with PyInstaller
+        run: pyinstaller school_bell.spec --clean
 
-      - name: 번들 내용 확인
-        if: always()
-        run: |
-          python -c "
-          import sys, os
-          # warn 파일에서 nacl 관련 경고 찾기
-          warn_file = os.path.join('build', '학교종', 'warn-학교종.txt')
-          if os.path.exists(warn_file):
-              with open(warn_file) as f:
-                  for line in f:
-                      if 'nacl' in line.lower():
-                          print('WARNING:', line.strip())
-          "
-          echo "--- build.log 에서 nacl 관련 ---"
-          findstr /i "nacl" build.log || echo "(nacl 관련 로그 없음)"
-
-      - name: 빌드 결과물 업로드
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 학교종-windows
+          name: school-bell-windows
           path: dist/학교종.exe
           retention-days: 30
-
-      - name: 빌드 로그 업로드
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
-          retention-days: 7

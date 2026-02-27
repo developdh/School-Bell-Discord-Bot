@@ -1,42 +1,39 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec — 학교종 봇 Windows 단일 실행파일 빌드
-# 빌드 전에 같은 폴더에 ffmpeg.exe 가 있어야 합니다.
+# PyInstaller spec — school bell bot Windows single-file build
 
 import importlib
 import os
-from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs
 
-# ── PyNaCl 네이티브 바이너리 강제 수집 ────────────────────────────────────────
+# -- Collect PyNaCl native binaries --
 nacl_datas, nacl_binaries, nacl_hiddenimports = collect_all('nacl')
 nacl_binaries += collect_dynamic_libs('nacl')
 
-# _sodium.pyd 를 명시적으로 찾아서 추가 (collect_all 이 놓칠 경우 대비)
+# Explicitly find _sodium.pyd and co-located DLLs
 try:
     _nacl_mod = importlib.import_module('nacl._sodium')
     _sodium_path = _nacl_mod.__file__
     if _sodium_path:
         nacl_binaries.append((_sodium_path, 'nacl'))
-        print(f"[spec] _sodium.pyd 발견: {_sodium_path}")
-        # 같은 디렉토리의 .dll 파일도 포함
+        print(f"[spec] found _sodium: {_sodium_path}")
         _nacl_dir = os.path.dirname(_sodium_path)
         for f in os.listdir(_nacl_dir):
             if f.endswith(('.dll', '.pyd')) and f != os.path.basename(_sodium_path):
                 full = os.path.join(_nacl_dir, f)
                 nacl_binaries.append((full, 'nacl'))
-                print(f"[spec] 추가 DLL 발견: {full}")
-        # .libs 디렉토리 체크 (일부 PyNaCl 버전에서 libsodium.dll 위치)
+                print(f"[spec] found extra binary: {full}")
         _libs_dir = os.path.join(_nacl_dir, '.libs')
         if os.path.isdir(_libs_dir):
             for f in os.listdir(_libs_dir):
                 if f.endswith('.dll'):
                     full = os.path.join(_libs_dir, f)
                     nacl_binaries.append((full, '.'))
-                    print(f"[spec] .libs DLL 발견: {full}")
+                    print(f"[spec] found .libs dll: {full}")
 except Exception as e:
-    print(f"[spec] WARNING: nacl._sodium import 실패: {e}")
+    print(f"[spec] WARNING: nacl._sodium import failed: {e}")
 
-print(f"[spec] nacl_binaries 수: {len(nacl_binaries)}")
-print(f"[spec] nacl_hiddenimports 수: {len(nacl_hiddenimports)}")
+print(f"[spec] nacl_binaries count: {len(nacl_binaries)}")
+print(f"[spec] nacl_hiddenimports count: {len(nacl_hiddenimports)}")
 
 a = Analysis(
     ["bot.py"],
@@ -50,7 +47,7 @@ a = Analysis(
         "discord.voice_client",
         "discord.player",
         "discord.backoff",
-        # PyNaCl — collect_all 이 놓칠 경우를 대비한 명시적 목록
+        # PyNaCl
         "nacl",
         "nacl._sodium",
         "nacl.bindings",
@@ -82,7 +79,7 @@ a = Analysis(
         "gtts.tts",
         # dotenv
         "dotenv",
-        # Windows 타임존 DB
+        # Windows timezone DB
         "tzdata",
     ],
     hookspath=[],
@@ -108,7 +105,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,         # 콘솔 창 표시 (로그 확인용)
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
