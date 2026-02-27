@@ -2,11 +2,16 @@
 # PyInstaller spec — 학교종 봇 Windows 단일 실행파일 빌드
 # 빌드 전에 같은 폴더에 ffmpeg.exe 가 있어야 합니다.
 
+from PyInstaller.utils.hooks import collect_all
+
+# PyNaCl 네이티브 바이너리(_sodium.pyd + libsodium.dll) 자동 수집
+nacl_datas, nacl_binaries, nacl_hiddenimports = collect_all('nacl')
+
 a = Analysis(
     ["bot.py"],
     pathex=[],
-    binaries=[("ffmpeg.exe", ".")],   # ffmpeg.exe 를 번들에 포함
-    datas=[],
+    binaries=[("ffmpeg.exe", ".")] + nacl_binaries,
+    datas=[] + nacl_datas,
     hiddenimports=[
         # discord.py voice
         "discord.gateway",
@@ -14,28 +19,7 @@ a = Analysis(
         "discord.voice_client",
         "discord.player",
         "discord.backoff",
-        # PyNaCl (discord voice 암호화)
-        "nacl",
-        "nacl.bindings",
-        "nacl.bindings._sodium",
-        "nacl.bindings.crypto_aead",
-        "nacl.bindings.crypto_box",
-        "nacl.bindings.crypto_generichash",
-        "nacl.bindings.crypto_hash",
-        "nacl.bindings.crypto_pwhash",
-        "nacl.bindings.crypto_scalarmult",
-        "nacl.bindings.crypto_secretbox",
-        "nacl.bindings.crypto_secretstream",
-        "nacl.bindings.crypto_shorthash",
-        "nacl.bindings.crypto_sign",
-        "nacl.bindings.randombytes",
-        "nacl.bindings.utils",
-        "nacl.public",
-        "nacl.secret",
-        "nacl.signing",
-        "nacl.encoding",
-        "nacl.hash",
-        "nacl.utils",
+    ] + nacl_hiddenimports + [
         # TTS
         "edge_tts",
         "edge_tts.communicate",
