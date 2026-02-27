@@ -1,1 +1,11 @@
-discord.py>=2.3.0
+# Discord bot (voice 지원 포함)
+discord.py[voice]>=2.3.0
+
+# TTS (edge-tts 우선, gTTS fallback)
+edge-tts>=6.1.9
+gTTS>=2.5.0
+
+# 시스템 의존성 (pip으로 설치 불가, OS 패키지 매니저 사용):
+#   macOS:  brew install ffmpeg
+#   Ubuntu: sudo apt install ffmpeg
+#   Windows: https://ffmpeg.org/download.html 후 PATH 등록
