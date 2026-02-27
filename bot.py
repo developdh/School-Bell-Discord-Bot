@@ -7,11 +7,21 @@ import json
 import logging
 import os
 import re
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import discord
+
+# ── Frozen(PyInstaller) 실행 여부 감지 ────────────────────────────────────────
+if getattr(sys, "frozen", False):
+    # .exe로 실행 중 — .env / state.json / tts_cache / bell.mp3 는 exe 옆에 위치
+    _BASE_DIR = Path(sys.executable).parent
+    _FFMPEG   = str(Path(sys._MEIPASS) / "ffmpeg.exe")
+else:
+    _BASE_DIR = Path(__file__).parent
+    _FFMPEG   = "ffmpeg"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,9 +31,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 KST        = ZoneInfo("Asia/Seoul")
-STATE_FILE = Path("state.json")
+STATE_FILE = _BASE_DIR / "state.json"
 PREFIX     = "--학교종"
-TTS_CACHE  = Path("./tts_cache")
+TTS_CACHE  = _BASE_DIR / "tts_cache"
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
 # guild_states[gid] = {
@@ -39,11 +49,13 @@ TTS_CACHE  = Path("./tts_cache")
 #   "pause_until": float|None,          ← runtime
 #   "last_channel_id": int|None,
 #   "last_voice_channel_id": int|None,  ← runtime
+#   "voice_notice_sent": bool,          ← runtime (음성채널 1회 안내 플래그)
 # }
-guild_states: dict[int, dict]         = {}
-guild_locks:  dict[int, asyncio.Lock] = {}
-guild_tasks:  dict[int, asyncio.Task] = {}
-voice_locks:  dict[int, asyncio.Lock] = {}
+guild_states:  dict[int, dict]          = {}
+guild_locks:   dict[int, asyncio.Lock]  = {}
+guild_tasks:   dict[int, asyncio.Task]  = {}
+voice_queues:  dict[int, asyncio.Queue] = {}  # 길드별 오디오 이벤트 큐
+voice_workers: dict[int, asyncio.Task]  = {}  # 길드별 큐 워커 태스크
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -109,15 +121,21 @@ def get_guild_state(gid: int) -> dict:
             "pause_until":           None,
             "last_channel_id":       None,
             "last_voice_channel_id": None,
+            "voice_notice_sent":     False,
         }
-        guild_locks[gid] = asyncio.Lock()
-        voice_locks[gid] = asyncio.Lock()
+        guild_locks[gid]  = asyncio.Lock()
+        voice_queues[gid] = asyncio.Queue()
     return guild_states[gid]
 
 
 def fmt_mm_ss(seconds: float) -> str:
     s = max(0, int(seconds))
     return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def state_exists(gs: dict) -> bool:
+    """타이머 또는 쉬는시간이 1개 이상 있으면 True."""
+    return bool(gs.get("timers")) or bool(gs.get("breaks"))
 
 
 # ── Timer ops ─────────────────────────────────────────────────────────────────
@@ -134,12 +152,7 @@ def timer_resume(timer: dict) -> None:
     timer["remaining_on_pause"] = None
 
 
-# ── TTS / Voice ───────────────────────────────────────────────────────────────
-
-def _tts_cache_path(sentence: str) -> Path:
-    safe = re.sub(r"[^\w가-힣]", "_", sentence)[:60]
-    return TTS_CACHE / f"{safe}.mp3"
-
+# ── TTS ───────────────────────────────────────────────────────────────────────
 
 async def _make_tts(sentence: str, path: Path) -> bool:
     """TTS 파일 생성. 성공 시 True 반환."""
@@ -148,7 +161,10 @@ async def _make_tts(sentence: str, path: Path) -> bool:
         import edge_tts
         comm = edge_tts.Communicate(sentence, voice="ko-KR-SunHiNeural")
         await comm.save(str(path))
-        return True
+        if path.exists() and path.stat().st_size > 0:
+            log.info("TTS 생성(edge-tts) → %s", path.name)
+            return True
+        log.warning("edge-tts 파일 크기 0, gTTS 시도")
     except Exception as e:
         log.warning("edge-tts 실패, gTTS 시도: %s", e)
 
@@ -156,92 +172,193 @@ async def _make_tts(sentence: str, path: Path) -> bool:
     try:
         from gtts import gTTS
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: gTTS(text=sentence, lang="ko").save(str(path)))
-        return True
+        await loop.run_in_executor(
+            None,
+            lambda: gTTS(text=sentence, lang="ko").save(str(path)),
+        )
+        if path.exists() and path.stat().st_size > 0:
+            log.info("TTS 생성(gTTS) → %s", path.name)
+            return True
+        log.warning("gTTS 파일 크기 0")
     except Exception as e:
         log.warning("gTTS 실패: %s", e)
 
     return False
 
 
-async def _get_tts_path(sentence: str) -> Path | None:
-    """TTS 파일 경로 반환 (없으면 생성)."""
+async def _get_tts_path_keyed(sentence: str, cache_key: str) -> Path | None:
+    """명시적 캐시 키로 TTS 파일 경로 반환 (없으면 생성)."""
     TTS_CACHE.mkdir(exist_ok=True)
-    path = _tts_cache_path(sentence)
-    if path.exists():
+    path = TTS_CACHE / cache_key
+    if path.exists() and path.stat().st_size > 0:
         return path
     ok = await _make_tts(sentence, path)
     return path if ok else None
 
 
-async def _play_voice_audio(
-    vc: discord.VoiceClient,
-    loop: asyncio.AbstractEventLoop,
-    path: Path,
-) -> None:
-    """단일 파일을 재생하고 완료까지 대기."""
-    done = asyncio.Event()
+# ── Voice ─────────────────────────────────────────────────────────────────────
 
-    def after(_: Exception | None) -> None:
-        loop.call_soon_threadsafe(done.set)
-
-    try:
-        vc.play(discord.FFmpegPCMAudio(str(path)), after=after)
-    except Exception as e:
-        log.warning("재생 시작 실패 %s: %s", path, e)
-        return
-    await done.wait()
-
-
-async def _play_voice(gid: int, sentence: str) -> None:
-    """벨 + TTS를 음성채널에서 순차 재생. 실패 시 로그만 남기고 스킵."""
-    gs = guild_states.get(gid, {})
-    if not gs.get("timers"):
-        return
-
+async def ensure_voice_connected(gid: int, gs: dict) -> discord.VoiceClient | None:
+    """음성채널 연결 상태 확인·유지. 이미 연결되어 있으면 그대로 반환."""
     vc_id = gs.get("last_voice_channel_id")
     if not vc_id:
-        return
+        return None
 
     vc_channel = bot.get_channel(vc_id)
     if not isinstance(vc_channel, discord.VoiceChannel):
+        log.warning("음성채널 채널 객체 없음 gid=%d cid=%d", gid, vc_id)
+        return None
+
+    existing = discord.utils.get(bot.voice_clients, guild=vc_channel.guild)
+    if existing and existing.is_connected():
+        if existing.channel.id != vc_id:
+            try:
+                await existing.move_to(vc_channel)
+                log.info("음성채널 이동 guild=%d → ch=%d", gid, vc_id)
+            except Exception:
+                log.exception("음성채널 이동 실패 guild=%d", gid)
+        return existing  # type: ignore[return-value]
+
+    try:
+        vc = await vc_channel.connect(timeout=10.0)
+        log.info("음성채널 연결 guild=%d ch=%d", gid, vc_id)
+        return vc
+    except discord.ClientException:
+        # 동시 connect 경쟁 발생 시 기존 연결 재조회
+        return discord.utils.get(bot.voice_clients, guild=vc_channel.guild)  # type: ignore[return-value]
+    except Exception:
+        log.exception("음성채널 연결 실패 guild=%d", gid)
+        return None
+
+
+async def ensure_voice_disconnected(gid: int) -> None:
+    """해당 길드의 음성채널 연결을 해제."""
+    guild = bot.get_guild(gid)
+    if guild is None:
         return
-
-    tts_path = await _get_tts_path(sentence)
-
-    vlock = voice_locks.get(gid)
-    if vlock is None:
-        return
-
-    async with vlock:
-        voice_client: discord.VoiceClient | None = None
+    existing = discord.utils.get(bot.voice_clients, guild=guild)
+    if existing:
         try:
-            loop = asyncio.get_running_loop()
-
-            # 이미 연결된 VoiceClient 확인
-            existing = discord.utils.get(bot.voice_clients, guild=vc_channel.guild)
-            if existing and existing.is_connected():
-                if existing.channel.id != vc_id:
-                    await existing.move_to(vc_channel)
-                voice_client = existing  # type: ignore[assignment]
-            else:
-                voice_client = await vc_channel.connect(timeout=10.0)
-
-            # 1) bell.mp3 / bell.wav 재생
-            for bell in (Path("bell.mp3"), Path("bell.wav")):
-                if bell.exists():
-                    await _play_voice_audio(voice_client, loop, bell)
-                    break
-
-            # 2) TTS 재생
-            if tts_path and tts_path.exists():
-                await _play_voice_audio(voice_client, loop, tts_path)
-
+            await existing.disconnect(force=True)
+            log.info("음성채널 해제 guild=%d", gid)
         except Exception:
-            log.exception("음성 재생 실패 guild=%d", gid)
-        finally:
-            if voice_client and voice_client.is_connected():
-                await voice_client.disconnect()
+            log.exception("음성채널 해제 실패 guild=%d", gid)
+
+
+async def _play_voice_audio(vc: discord.VoiceClient, path: Path) -> None:
+    """단일 파일 재생 후 완료 대기 (최대 5분 타임아웃)."""
+    if not path.exists() or path.stat().st_size == 0:
+        log.warning("재생 파일 없거나 크기 0: %s", path)
+        return
+
+    if vc.is_playing():
+        log.warning("이미 재생 중 — stop 후 재생: %s", path.name)
+        vc.stop()
+        await asyncio.sleep(0.1)
+
+    loop    = asyncio.get_running_loop()
+    done    = loop.create_future()
+
+    def after(err: Exception | None) -> None:
+        if not done.done():
+            if err:
+                loop.call_soon_threadsafe(done.set_exception, err)
+            else:
+                loop.call_soon_threadsafe(done.set_result, None)
+
+    try:
+        vc.play(discord.FFmpegOpusAudio(str(path), executable=_FFMPEG), after=after)
+        log.debug("재생 시작: %s", path.name)
+    except Exception as exc:
+        log.warning("FFmpegOpusAudio 오류 [%s]: %s  (%s)", path.name, exc, type(exc).__name__)
+        return
+
+    try:
+        await asyncio.wait_for(asyncio.shield(done), timeout=300.0)
+        log.debug("재생 완료: %s", path.name)
+    except asyncio.TimeoutError:
+        log.warning("재생 타임아웃 [%s]", path.name)
+        try:
+            vc.stop()
+        except Exception:
+            pass
+    except Exception as exc:
+        log.warning("재생 오류 [%s]: %s", path.name, exc)
+
+
+async def _voice_worker(gid: int) -> None:
+    """
+    길드별 오디오 큐 워커.
+    큐에서 (sentence, cache_key) 를 꺼내 벨 → TTS 순서로 순차 재생.
+    재생 도중 다른 이벤트는 큐에 쌓여 대기.
+    """
+    log.info("음성 워커 시작 guild=%d", gid)
+    q = voice_queues[gid]
+    try:
+        while True:
+            sentence, cache_key = await q.get()
+            try:
+                gs = guild_states.get(gid)
+                if gs is None or not state_exists(gs):
+                    log.debug("상태 없음, 오디오 스킵 guild=%d", gid)
+                    continue
+
+                # TTS 생성 (느리므로 VC 연결 전에 수행)
+                tts_path = await _get_tts_path_keyed(sentence, cache_key)
+
+                # VC 연결 확인
+                vc = await ensure_voice_connected(gid, gs)
+                if vc is None:
+                    log.debug("음성 연결 불가, 오디오 스킵 guild=%d", gid)
+                    continue
+
+                # 1) 벨
+                for bell in (_BASE_DIR / "bell.mp3", _BASE_DIR / "bell.wav"):
+                    if bell.exists():
+                        await _play_voice_audio(vc, bell)
+                        break
+                else:
+                    log.debug("bell.mp3 / bell.wav 없음, 벨 스킵")
+
+                # 2) TTS
+                if tts_path:
+                    await _play_voice_audio(vc, tts_path)
+                else:
+                    log.debug("TTS 생성 실패, TTS 스킵 guild=%d", gid)
+
+            except Exception:
+                log.exception("오디오 재생 오류 guild=%d", gid)
+            finally:
+                q.task_done()
+
+    except asyncio.CancelledError:
+        log.info("음성 워커 종료 guild=%d", gid)
+
+
+def _ensure_voice_worker(gid: int) -> None:
+    """워커 태스크가 살아있지 않으면 새로 시작."""
+    w = voice_workers.get(gid)
+    if w is None or w.done():
+        if gid not in voice_queues:
+            voice_queues[gid] = asyncio.Queue()
+        voice_workers[gid] = asyncio.create_task(_voice_worker(gid))
+
+
+def _cancel_voice_worker(gid: int) -> None:
+    """워커 태스크를 취소."""
+    w = voice_workers.pop(gid, None)
+    if w and not w.done():
+        w.cancel()
+
+
+def play_event_audio(gid: int, sentence: str, cache_key: str) -> None:
+    """이벤트 오디오(벨+TTS)를 큐에 추가. 워커가 순차 재생."""
+    q = voice_queues.get(gid)
+    if q is None:
+        return
+    q.put_nowait((sentence, cache_key))
+    _ensure_voice_worker(gid)
+    log.debug("오디오 큐 추가 guild=%d [%s]", gid, cache_key)
 
 
 # ── Notifications ─────────────────────────────────────────────────────────────
@@ -272,13 +389,19 @@ async def _break_channels(gs: dict) -> list[discord.TextChannel]:
     return result
 
 
-async def notify_transition(gid: int, cid: int, name: str, mode: str) -> None:
+async def notify_transition(
+    gid: int, cid: int, name: str, mode: str
+) -> None:
     ch = await _get_channel(cid)
     if ch:
         label = "휴식" if mode == "rest" else "공부"
         await ch.send(f"🔔 학교종! **{name}** {label}")
-    sentence = f"{name} {'공부' if mode == 'study' else '휴식'} 시작"
-    asyncio.create_task(_play_voice(gid, sentence))
+
+    label_kr  = "공부" if mode == "study" else "휴식"
+    sentence  = f"{name} {label_kr} 시작."
+    safe_name = re.sub(r"[^\w가-힣]", "_", name)[:20]
+    cache_key = f"{gid}_tr_{safe_name}_{mode}.mp3"
+    play_event_audio(gid, sentence, cache_key)
 
 
 async def notify_break_event(
@@ -293,20 +416,22 @@ async def notify_break_event(
     else:
         msg = (
             f"⏸️ **{brk['label']}** 쉬는시간! "
-            f"{brk['duration_sec'] // 60}분 일시정지 "
+            f"{_fmt_dur(brk['duration_sec'])} 일시정지 "
             f"(→ {end_dt.strftime('%H:%M:%S')} 재개)"
         )
     for ch in await _break_channels(gs):
         await ch.send(msg)
     if not extending:
-        sentence = f"{brk['label']} 쉬는시간 시작. 모두 일시정지"
-        asyncio.create_task(_play_voice(gid, sentence))
+        sentence   = f"{brk['label']} 시작."
+        safe_label = re.sub(r"[^\w가-힣]", "_", brk["label"])[:20]
+        cache_key  = f"{gid}_brk_{safe_label}.mp3"
+        play_event_audio(gid, sentence, cache_key)
 
 
 async def notify_resume(gid: int, gs: dict) -> None:
     for ch in await _break_channels(gs):
         await ch.send("▶️ 쉬는시간 종료! 모든 타이머 재개")
-    asyncio.create_task(_play_voice(gid, "쉬는시간 종료. 모두 재개"))
+    play_event_audio(gid, "쉬는시간 종료.", f"{gid}_resume.mp3")
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -330,17 +455,14 @@ async def guild_scheduler(gid: int) -> None:
                     bt = brk.get("_next_ts")
                     if bt is None or ts < bt:
                         continue
-                    # 이 쉬는시간이 지금 발동
                     end_ts   = ts + brk["duration_sec"]
                     already  = gs["pause_until"] is not None
                     if not already or gs["pause_until"] < end_ts:
                         if not already:
-                            # 처음 일시정지: 모든 타이머 남은 시간 저장
                             for t in gs["timers"].values():
                                 timer_pause(t)
                         gs["pause_until"] = end_ts
                         await notify_break_event(gid, gs, brk, end_ts, already)
-                    # 다음 날 스케줄로 갱신
                     brk["_next_ts"] = next_occurrence_ts(brk["hhmm"])
 
                 # 2) 일시정지 종료 체크
@@ -356,12 +478,27 @@ async def guild_scheduler(gid: int) -> None:
                         if ts >= t["phase_end_at"]:
                             overshoot = ts - t["phase_end_at"]
                             new_mode  = "rest" if t["mode"] == "study" else "study"
-                            t["mode"]          = new_mode
-                            t["phase_end_at"]  = ts + t[f"{new_mode}_sec"] - overshoot
-                            await notify_transition(gid, t["channel_id"], name, new_mode)
+                            t["mode"]         = new_mode
+                            t["phase_end_at"] = ts + t[f"{new_mode}_sec"] - overshoot
+                            await notify_transition(
+                                gid, t["channel_id"], name, new_mode
+                            )
+
+                # 4) 음성채널 연결 유지
+                if state_exists(gs) and gs.get("last_voice_channel_id"):
+                    _ensure_voice_worker(gid)
+                    # 워커가 큐를 처리 중이 아닐 때만 직접 연결 확인
+                    q = voice_queues.get(gid)
+                    if q is not None and q.empty():
+                        asyncio.create_task(ensure_voice_connected(gid, gs))
+                elif not state_exists(gs):
+                    _cancel_voice_worker(gid)
+                    asyncio.create_task(ensure_voice_disconnected(gid))
 
     except asyncio.CancelledError:
         log.info("스케줄러 종료 guild=%d", gid)
+        _cancel_voice_worker(gid)
+        await ensure_voice_disconnected(gid)
     except Exception:
         log.exception("스케줄러 예외 guild=%d", gid)
 
@@ -374,23 +511,40 @@ def ensure_scheduler(gid: int) -> None:
 
 # ── Parser ────────────────────────────────────────────────────────────────────
 
-_RE_TIME = re.compile(r"^(\d+)분(공부|휴식)$")
-_RE_DUR  = re.compile(r"^(\d+)분$")
+_RE_TIME = re.compile(r"^(\d+)(초|분|시간)(공부|휴식)$")
+_RE_DUR  = re.compile(r"^(\d+)(초|분|시간)$")
 _RE_HHMM = re.compile(r"^\d{1,2}:\d{2}$")
 
 
+def _unit_to_sec(n: int, unit: str) -> int:
+    if unit == "초":   return n
+    if unit == "시간": return n * 3600
+    return n * 60  # 분
+
+
+def _fmt_dur(sec: int) -> str:
+    """초 → 사람이 읽기 좋은 문자열 (예: '30초', '10분', '1시간 30분')"""
+    h, rem = divmod(sec, 3600)
+    m, s   = divmod(rem, 60)
+    parts  = []
+    if h: parts.append(f"{h}시간")
+    if m: parts.append(f"{m}분")
+    if s: parts.append(f"{s}초")
+    return " ".join(parts) if parts else "0초"
+
+
 def _time_tok(s: str) -> tuple[str, int] | None:
-    """'10분공부' → ('study', 600), '5분휴식' → ('rest', 300)"""
+    """'10분공부' → ('study', 600), '30초휴식' → ('rest', 30), '1시간공부' → ('study', 3600)"""
     m = _RE_TIME.match(s)
     if not m:
         return None
-    return ("study" if m.group(2) == "공부" else "rest"), int(m.group(1)) * 60
+    return ("study" if m.group(3) == "공부" else "rest"), _unit_to_sec(int(m.group(1)), m.group(2))
 
 
 def _dur_tok(s: str) -> int | None:
-    """'20분' → 1200"""
+    """'20분' → 1200, '30초' → 30, '1시간' → 3600"""
     m = _RE_DUR.match(s)
-    return int(m.group(1)) * 60 if m else None
+    return _unit_to_sec(int(m.group(1)), m.group(2)) if m else None
 
 
 def parse_command(raw: str) -> list[dict]:
@@ -517,7 +671,7 @@ def build_status(gs: dict) -> str:
             ndt = datetime.fromtimestamp(nts, tz=KST)
             lines.append(
                 f"  • **{b['label']}** → {ndt.strftime('%m/%d %H:%M')} "
-                f"({b['duration_sec'] // 60}분)"
+                f"({_fmt_dur(b['duration_sec'])})"
             )
     else:
         lines.append("🔔 등록된 쉬는시간 없음")
@@ -525,7 +679,7 @@ def build_status(gs: dict) -> str:
     return "\n".join(lines)
 
 
-# ── Help builder ─────────────────────────────────────────────────────────────
+# ── Help builder ──────────────────────────────────────────────────────────────
 
 def build_help() -> str:
     return (
@@ -534,8 +688,11 @@ def build_help() -> str:
         "**1) 개인 타이머 설정/재설정**\n"
         "```\n"
         "--학교종 이름 10분공부 5분휴식\n"
-        "--학교종 김동희 10분공부 5분휴식 서채영 100분공부 20분휴식\n"
+        "--학교종 이름 30초공부 10초휴식\n"
+        "--학교종 이름 1시간공부 10분휴식\n"
+        "--학교종 김동희 10분공부 5분휴식 서채영 1시간공부 20분휴식\n"
         "```\n"
+        "• 시간 단위: 초 / 분 / 시간 모두 가능합니다.\n"
         "• 공부/휴식 순서는 무관합니다.\n"
         "• 이미 등록된 이름이면 타이머가 재설정됩니다.\n"
         "\n"
@@ -553,6 +710,8 @@ def build_help() -> str:
         "**4) 쉬는시간 등록**\n"
         "```\n"
         "--학교종 쉬는시간 점심시간 18:00 20분\n"
+        "--학교종 쉬는시간 쉬는시간 14:30 10초\n"
+        "--학교종 쉬는시간 점심시간 12:00 1시간\n"
         "```\n"
         "• HH:MM이 이미 지났으면 다음 날로 자동 예약됩니다.\n"
         "\n"
@@ -573,9 +732,12 @@ def build_help() -> str:
         "```\n"
         "\n"
         "🔊 **음성 안내**\n"
-        "• 타이머가 켜진 상태에서 명령을 보낸 사용자가 음성채널에 접속해 있으면,\n"
-        "  봇이 해당 채널에 들어와 종소리 + TTS로 전환/쉬는시간을 안내합니다.\n"
-        "• 필요 권한: `Connect` / `Speak`"
+        "• 명령을 보낸 사용자가 음성채널에 있으면 봇이 그 채널에 상주하며,\n"
+        "  타이머 전환·쉬는시간마다 종소리(bell.mp3) + TTS로 안내합니다.\n"
+        "• 음성 안내를 위해 프로젝트 루트에 bell.mp3 를 넣어주세요.\n"
+        "• 필요 권한: `Connect` / `Speak`\n"
+        "• TTS 패키지: `pip install edge-tts` (또는 gTTS fallback)\n"
+        "• FFmpeg 필수: `brew install ffmpeg` / `sudo apt install ffmpeg`"
     )
 
 
@@ -687,11 +849,14 @@ async def on_message(msg: discord.Message) -> None:
             elif atype == "shutdown_all":
                 gs["timers"].clear()
                 gs["breaks"].clear()
-                gs["pause_until"] = None
+                gs["pause_until"]       = None
+                gs["voice_notice_sent"] = False
                 save_state()
                 task = guild_tasks.pop(gid, None)
                 if task:
                     task.cancel()
+                _cancel_voice_worker(gid)
+                asyncio.create_task(ensure_voice_disconnected(gid))
                 replies.append("✅ 전체 종료: 모든 타이머/쉬는시간 중지")
 
             # ── 쉬는시간 강제 종료 ──
@@ -703,7 +868,6 @@ async def on_message(msg: discord.Message) -> None:
                     for t in gs["timers"].values():
                         timer_resume(t)
                     await notify_resume(gid, gs)
-                    replies.append("▶️ 쉬는시간 강제 종료: 모든 타이머 재개")
 
             # ── 종료 ──
             elif atype == "stop":
@@ -712,6 +876,10 @@ async def on_message(msg: discord.Message) -> None:
                     del gs["timers"][name]
                     save_state()
                     replies.append(f"✅ **{name}** 타이머 종료")
+                    # 상태가 없어졌으면 음성도 해제
+                    if not state_exists(gs):
+                        _cancel_voice_worker(gid)
+                        asyncio.create_task(ensure_voice_disconnected(gid))
                 else:
                     replies.append(f"❌ **{name}** 타이머 없음")
 
@@ -728,7 +896,7 @@ async def on_message(msg: discord.Message) -> None:
                 ndt = datetime.fromtimestamp(brk["_next_ts"], tz=KST)
                 replies.append(
                     f"✅ 쉬는시간 **{act['label']}** 등록 "
-                    f"— {ndt.strftime('%m/%d %H:%M')} ({act['duration_sec'] // 60}분)"
+                    f"— {ndt.strftime('%m/%d %H:%M')} ({_fmt_dur(act['duration_sec'])})"
                 )
                 ensure_scheduler(gid)
 
@@ -743,7 +911,6 @@ async def on_message(msg: discord.Message) -> None:
                     "phase_end_at":       ts_now + act["study_sec"],
                     "remaining_on_pause": None,
                 }
-                # 현재 pause 중이면 이 타이머도 즉시 pause 상태로
                 if gs["pause_until"] is not None:
                     timer_pause(entry)
                 gs["timers"][act["name"]] = entry
@@ -762,13 +929,38 @@ async def on_message(msg: discord.Message) -> None:
                     )
                 ensure_scheduler(gid)
 
+        # 상태가 있는데 음성채널 미설정이면 1회만 안내
+        if (
+            state_exists(gs)
+            and not gs.get("last_voice_channel_id")
+            and not gs.get("voice_notice_sent")
+        ):
+            gs["voice_notice_sent"] = True
+            replies.append(
+                "ℹ️ 음성채널에 접속한 뒤 명령을 입력하면 음성 안내가 활성화됩니다."
+            )
+
         await send_split(msg.channel, "\n".join(replies))
 
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # .env 파일 로드 (exe 옆 또는 소스 디렉토리)
+    _env_file = _BASE_DIR / ".env"
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_file)
+    except ImportError:
+        pass
+
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
-        raise SystemExit("DISCORD_TOKEN 환경변수를 설정하세요.")
+        # 첫 실행 시 토큰 입력 후 .env 에 저장
+        token = input("Discord 봇 토큰을 입력하세요: ").strip()
+        if token:
+            _env_file.write_text(f"DISCORD_TOKEN={token}\n", encoding="utf-8")
+            print(f".env 저장 완료 ({_env_file})")
+        else:
+            raise SystemExit("토큰이 없습니다.")
     bot.run(token, log_handler=None)

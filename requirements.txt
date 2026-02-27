@@ -1,11 +1,17 @@
-# Discord bot (voice 지원 포함)
+# Discord bot (voice 지원 포함 — PyNaCl 자동 설치)
 discord.py[voice]>=2.3.0
 
 # TTS (edge-tts 우선, gTTS fallback)
 edge-tts>=6.1.9
 gTTS>=2.5.0
 
-# 시스템 의존성 (pip으로 설치 불가, OS 패키지 매니저 사용):
-#   macOS:  brew install ffmpeg
-#   Ubuntu: sudo apt install ffmpeg
-#   Windows: https://ffmpeg.org/download.html 후 PATH 등록
+# .env 파일 로드
+python-dotenv>=1.0.0
+
+# Windows 타임존 DB (zoneinfo 용, macOS/Linux 불필요)
+tzdata>=2024.1
+
+# 시스템 의존성 — pip 불가, OS 패키지 매니저로 설치:
+#   macOS  : brew install ffmpeg
+#   Ubuntu : sudo apt install ffmpeg
+#   Windows: exe 빌드 시 자동 포함 (school_bell.spec 참고)
