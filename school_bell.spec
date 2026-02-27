@@ -81,6 +81,9 @@ a = Analysis(
         "edge_tts.submaker",
         "gtts",
         "gtts.tts",
+        # cffi (required by PyNaCl)
+        "_cffi_backend",
+        "cffi",
         # dotenv
         "dotenv",
         # Windows timezone DB
