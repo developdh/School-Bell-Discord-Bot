@@ -51,6 +51,7 @@ TTS_CACHE  = _BASE_DIR / "tts_cache"
 #   },
 #   "presets": { name: "raw command string", ... },
 #   "breaks": [{ label, hhmm, duration_sec, _next_ts }],
+#   "recurring_breaks": [{ label, hhmm, duration_sec, _next_ts }],  ← 매일 반복
 #   "pause_until": float|None,          ← runtime
 #   "last_channel_id": int|None,
 #   "last_voice_channel_id": int|None,  ← runtime
@@ -100,6 +101,14 @@ def save_state() -> None:
                 }
                 for b in gs["breaks"]
             ],
+            "recurring_breaks": [
+                {
+                    "label":        b["label"],
+                    "hhmm":         b["hhmm"],
+                    "duration_sec": b["duration_sec"],
+                }
+                for b in gs["recurring_breaks"]
+            ],
         }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -127,6 +136,7 @@ def get_guild_state(gid: int) -> dict:
             "timers":                   {},
             "presets":                  {},
             "breaks":                   [],
+            "recurring_breaks":         [],
             "pause_until":              None,
             "last_channel_id":          None,
             "last_voice_channel_id":    None,
@@ -145,7 +155,7 @@ def fmt_mm_ss(seconds: float) -> str:
 
 def state_exists(gs: dict) -> bool:
     """타이머 또는 쉬는시간이 1개 이상 있으면 True."""
-    return bool(gs.get("timers")) or bool(gs.get("breaks"))
+    return bool(gs.get("timers")) or bool(gs.get("breaks")) or bool(gs.get("recurring_breaks"))
 
 
 # ── Timer ops ─────────────────────────────────────────────────────────────────
@@ -485,8 +495,8 @@ async def guild_scheduler(gid: int) -> None:
                     return
                 ts = now_ts()
 
-                # 1) 쉬는시간 체크
-                for brk in gs["breaks"]:
+                # 1) 쉬는시간 체크 (일반 + 정규)
+                for brk in gs["breaks"] + gs["recurring_breaks"]:
                     bt = brk.get("_next_ts")
                     if bt is None or ts < bt:
                         continue
@@ -641,6 +651,7 @@ def parse_command(raw: str) -> list[dict]:
       3) "쉬는시간 끝"                   → break_end
       3a) "쉬는시간 목록"               → break_list
       3b) "쉬는시간 삭제 [라벨]"        → break_delete
+      3b-2) "정규쉬는시간 추가/목록/삭제" → recurring_break_*
       3c) "일시정지 [이름]"             → personal_pause
       3d) "재개 [이름]"                 → personal_resume
       3e) "남은시간 [이름] [N분]"       → set_remaining
@@ -723,6 +734,31 @@ def parse_command(raw: str) -> list[dict]:
             actions.append({"type": "break_delete", "label": tokens[i + 2]})
             i += 3
             continue
+
+        # 3b-2) 정규쉬는시간 추가/목록/삭제
+        if tok == "정규쉬는시간" and i + 1 < len(tokens):
+            sub = tokens[i + 1]
+            if sub == "추가" and i + 4 < len(tokens):
+                label, hhmm, dur_s = tokens[i + 2], tokens[i + 3], tokens[i + 4]
+                if _RE_HHMM.match(hhmm):
+                    dur = _dur_tok(dur_s)
+                    if dur is not None:
+                        actions.append({
+                            "type":         "recurring_break_add",
+                            "label":        label,
+                            "hhmm":         hhmm,
+                            "duration_sec": dur,
+                        })
+                        i += 5
+                        continue
+            if sub == "목록":
+                actions.append({"type": "recurring_break_list"})
+                i += 2
+                continue
+            if sub == "삭제" and i + 2 < len(tokens):
+                actions.append({"type": "recurring_break_delete", "label": tokens[i + 2]})
+                i += 3
+                continue
 
         # 3c) 일시정지 [이름]
         if tok == "일시정지" and i + 1 < len(tokens):
@@ -857,6 +893,18 @@ def build_status(gs: dict) -> str:
     else:
         lines.append("🔔 등록된 쉬는시간 없음")
 
+    # 정규쉬는시간 목록
+    if gs["recurring_breaks"]:
+        lines.append("**🔁 정규쉬는시간 목록**")
+        for b in gs["recurring_breaks"]:
+            nts = b.get("_next_ts") or next_occurrence_ts(b["hhmm"])
+            ndt = datetime.fromtimestamp(nts, tz=KST)
+            lines.append(
+                f"  • **{b['label']}** 매일 {b['hhmm']} "
+                f"({_fmt_dur(b['duration_sec'])}) "
+                f"→ 다음: {ndt.strftime('%m/%d %H:%M')}"
+            )
+
     # 음성채널 고정 표시
     pvc = gs.get("pinned_voice_channel_id")
     if pvc:
@@ -932,12 +980,21 @@ def build_help() -> str:
         "--학교종 쉬는시간 삭제 점심시간\n"
         "```\n"
         "\n"
-        "**8) 쉬는시간 강제 종료** (현재 일시정지 즉시 해제, 스케줄은 유지)\n"
+        "**8) 정규쉬는시간** (매일 반복)\n"
+        "```\n"
+        "--학교종 정규쉬는시간 추가 점심 12:00 1시간\n"
+        "--학교종 정규쉬는시간 목록\n"
+        "--학교종 정규쉬는시간 삭제 점심\n"
+        "```\n"
+        "• 매일 같은 시각에 자동 발동하는 쉬는시간입니다.\n"
+        "• 봇이 꺼져 있던 동안 지나간 시각은 소급 적용되지 않습니다.\n"
+        "\n"
+        "**9) 쉬는시간 강제 종료** (현재 일시정지 즉시 해제, 스케줄은 유지)\n"
         "```\n"
         "--학교종 쉬는시간 끝\n"
         "```\n"
         "\n"
-        "**9) 음성채널 고정 / 해제**\n"
+        "**10) 음성채널 고정 / 해제**\n"
         "```\n"
         "--학교종 음성채널 고정\n"
         "--학교종 음성채널 해제\n"
@@ -945,7 +1002,7 @@ def build_help() -> str:
         "• 고정하면 봇 재시작 후에도 해당 채널에 자동 접속합니다.\n"
         "• 해제하면 명령 시점의 사용자 음성채널을 따릅니다.\n"
         "\n"
-        "**10) 프리셋 저장 / 실행 / 목록 / 삭제**\n"
+        "**11) 프리셋 저장 / 실행 / 목록 / 삭제**\n"
         "```\n"
         "--학교종 프리셋 저장 집중모드 김동희 10분공부 5분휴식 4회반복\n"
         "--학교종 프리셋 실행 집중모드\n"
@@ -954,12 +1011,12 @@ def build_help() -> str:
         "```\n"
         "• 자주 쓰는 명령을 이름으로 저장해두고 한 번에 실행합니다.\n"
         "\n"
-        "**11) 상태 출력**\n"
+        "**12) 상태 출력**\n"
         "```\n"
         "--학교종 상태\n"
         "```\n"
         "\n"
-        "**12) 도움말**\n"
+        "**13) 도움말**\n"
         "```\n"
         "--학교종 도움말\n"
         "--학교종 help\n"
@@ -1025,6 +1082,15 @@ async def on_ready() -> None:
                 "_next_ts":     next_occurrence_ts(b["hhmm"]),
             })
 
+        # 정규쉬는시간 복구 (다음 예정 시각만 재계산, 소급 적용 없음)
+        for b in data.get("recurring_breaks", []):
+            gs["recurring_breaks"].append({
+                "label":        b["label"],
+                "hhmm":         b["hhmm"],
+                "duration_sec": b["duration_sec"],
+                "_next_ts":     next_occurrence_ts(b["hhmm"]),
+            })
+
         # 타이머 복구 — mode=study, now부터 리셋
         for name, td in data.get("timers", {}).items():
             gs["timers"][name] = {
@@ -1040,7 +1106,7 @@ async def on_ready() -> None:
                 "_auto_stop_ts":               None,
             }
 
-        if gs["timers"] or gs["breaks"]:
+        if gs["timers"] or gs["breaks"] or gs["recurring_breaks"]:
             ensure_scheduler(gid)
 
     log.info("준비 완료")
@@ -1097,6 +1163,7 @@ async def on_message(msg: discord.Message) -> None:
             elif atype == "shutdown_all":
                 gs["timers"].clear()
                 gs["breaks"].clear()
+                gs["recurring_breaks"].clear()
                 gs["pause_until"]              = None
                 gs["pinned_voice_channel_id"]  = None
                 gs["last_voice_channel_id"]    = None
@@ -1208,6 +1275,55 @@ async def on_message(msg: discord.Message) -> None:
                         asyncio.create_task(ensure_voice_disconnected(gid))
                 else:
                     replies.append(f"❌ **{label}** 쉬는시간을 찾을 수 없습니다.")
+
+            # ── 정규쉬는시간 추가 ──
+            elif atype == "recurring_break_add":
+                brk = {
+                    "label":        act["label"],
+                    "hhmm":         act["hhmm"],
+                    "duration_sec": act["duration_sec"],
+                    "_next_ts":     next_occurrence_ts(act["hhmm"]),
+                }
+                gs["recurring_breaks"].append(brk)
+                save_state()
+                ndt = datetime.fromtimestamp(brk["_next_ts"], tz=KST)
+                replies.append(
+                    f"✅ 정규쉬는시간 **{act['label']}** 등록 "
+                    f"— 매일 {act['hhmm']} ({_fmt_dur(act['duration_sec'])}) "
+                    f"→ 다음: {ndt.strftime('%m/%d %H:%M')}"
+                )
+                ensure_scheduler(gid)
+
+            # ── 정규쉬는시간 목록 ──
+            elif atype == "recurring_break_list":
+                if gs["recurring_breaks"]:
+                    lines = ["**🔁 정규쉬는시간 목록**"]
+                    for idx, b in enumerate(gs["recurring_breaks"], 1):
+                        nts = b.get("_next_ts") or next_occurrence_ts(b["hhmm"])
+                        ndt = datetime.fromtimestamp(nts, tz=KST)
+                        lines.append(
+                            f"  {idx}. **{b['label']}** 매일 {b['hhmm']} "
+                            f"({_fmt_dur(b['duration_sec'])}) "
+                            f"→ 다음: {ndt.strftime('%m/%d %H:%M')}"
+                        )
+                    replies.append("\n".join(lines))
+                else:
+                    replies.append("🔁 등록된 정규쉬는시간이 없습니다.")
+
+            # ── 정규쉬는시간 삭제 ──
+            elif atype == "recurring_break_delete":
+                label = act["label"]
+                before = len(gs["recurring_breaks"])
+                gs["recurring_breaks"] = [b for b in gs["recurring_breaks"] if b["label"] != label]
+                removed = before - len(gs["recurring_breaks"])
+                if removed:
+                    save_state()
+                    replies.append(f"✅ 정규쉬는시간 **{label}** 삭제 ({removed}건)")
+                    if not state_exists(gs):
+                        _cancel_voice_worker(gid)
+                        asyncio.create_task(ensure_voice_disconnected(gid))
+                else:
+                    replies.append(f"❌ **{label}** 정규쉬는시간을 찾을 수 없습니다.")
 
             # ── 프리셋 저장 ──
             elif atype == "preset_save":
