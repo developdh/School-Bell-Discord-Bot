@@ -52,17 +52,21 @@ TTS_CACHE  = _BASE_DIR / "tts_cache"
 #   "presets": { name: "raw command string", ... },
 #   "breaks": [{ label, hhmm, duration_sec, _next_ts }],
 #   "recurring_breaks": [{ label, hhmm, duration_sec, _next_ts }],  ← 매일 반복
+#   "stats": { "YYYY-MM-DD": { name: { "study": float, "rest": float } } },
 #   "pause_until": float|None,          ← runtime
 #   "last_channel_id": int|None,
 #   "last_voice_channel_id": int|None,  ← runtime
 #   "pinned_voice_channel_id": int|None, ← 고정 음성채널 (persist)
 #   "voice_notice_sent": bool,          ← runtime (음성채널 1회 안내 플래그)
+#   "status_panel_channel_id": int|None,  ← 패널 메시지 채널 (persist)
+#   "status_panel_message_id": int|None,  ← 패널 메시지 ID (persist)
 # }
 guild_states:  dict[int, dict]          = {}
 guild_locks:   dict[int, asyncio.Lock]  = {}
 guild_tasks:   dict[int, asyncio.Task]  = {}
 voice_queues:  dict[int, asyncio.Queue] = {}  # 길드별 오디오 이벤트 큐
 voice_workers: dict[int, asyncio.Task]  = {}  # 길드별 큐 워커 태스크
+panel_tasks:   dict[int, asyncio.Task]  = {}  # 길드별 패널 자동갱신 태스크
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -109,6 +113,9 @@ def save_state() -> None:
                 }
                 for b in gs["recurring_breaks"]
             ],
+            "stats": gs.get("stats", {}),
+            "status_panel_channel_id": gs.get("status_panel_channel_id"),
+            "status_panel_message_id": gs.get("status_panel_message_id"),
         }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -137,11 +144,14 @@ def get_guild_state(gid: int) -> dict:
             "presets":                  {},
             "breaks":                   [],
             "recurring_breaks":         [],
+            "stats":                    {},
             "pause_until":              None,
             "last_channel_id":          None,
             "last_voice_channel_id":    None,
             "pinned_voice_channel_id":  None,
             "voice_notice_sent":        False,
+            "status_panel_channel_id":  None,
+            "status_panel_message_id":  None,
         }
         guild_locks[gid]  = asyncio.Lock()
         voice_queues[gid] = asyncio.Queue()
@@ -195,6 +205,17 @@ def timer_personal_resume(timer: dict, gs: dict) -> None:
         timer["remaining_on_pause"] = rem
     else:
         timer["phase_end_at"] = now_ts() + rem
+
+
+def _accumulate_stats(gs: dict, name: str, mode: str, seconds: float) -> None:
+    """통계 누적 (날짜는 현재 KST 기준)."""
+    if seconds <= 0:
+        return
+    date_key = datetime.now(KST).strftime("%Y-%m-%d")
+    stats = gs.setdefault("stats", {})
+    day = stats.setdefault(date_key, {})
+    entry = day.setdefault(name, {"study": 0.0, "rest": 0.0})
+    entry["study" if mode == "study" else "rest"] += seconds
 
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
@@ -504,10 +525,17 @@ async def guild_scheduler(gid: int) -> None:
                     already  = gs["pause_until"] is not None
                     if not already or gs["pause_until"] < end_ts:
                         if not already:
+                            for _n, _t in gs["timers"].items():
+                                if _t.get("remaining_on_personal_pause") is None:
+                                    _acc = _t.get("_last_accounted_at")
+                                    if _acc is not None and _acc < ts:
+                                        _accumulate_stats(gs, _n, _t["mode"], ts - _acc)
+                                    _t["_last_accounted_at"] = ts
                             for t in gs["timers"].values():
                                 timer_pause(t)
                         gs["pause_until"] = end_ts
                         await notify_break_event(gid, gs, brk, end_ts, already)
+                        asyncio.create_task(update_status_panel(gid))
                     brk["_next_ts"] = next_occurrence_ts(brk["hhmm"])
 
                 # 2) 일시정지 종료 체크
@@ -515,13 +543,21 @@ async def guild_scheduler(gid: int) -> None:
                     gs["pause_until"] = None
                     for t in gs["timers"].values():
                         timer_resume(t)
+                        t["_last_accounted_at"] = ts
                     await notify_resume(gid, gs)
+                    asyncio.create_task(update_status_panel(gid))
 
                 # 3) 개인 타이머 전환 체크 (pause 중 아닐 때만)
                 if gs["pause_until"] is None:
                     for name, t in list(gs["timers"].items()):
                         if t.get("remaining_on_personal_pause") is not None:
                             continue
+
+                        # ── Stats accumulation ──
+                        _acc = t.get("_last_accounted_at")
+                        if _acc is not None and _acc < ts:
+                            _accumulate_stats(gs, name, t["mode"], ts - _acc)
+                        t["_last_accounted_at"] = ts
 
                         # Auto-stop: 시간 제한
                         if t.get("_auto_stop_ts") is not None and ts >= t["_auto_stop_ts"]:
@@ -533,6 +569,7 @@ async def guild_scheduler(gid: int) -> None:
                                 await ch.send(f"🏁 **{name}** 시간 도달 → 자동 종료")
                             safe = re.sub(r"[^\w가-힣]", "_", name)[:20]
                             play_event_audio(gid, f"{name} 자동 종료.", f"{gid}_as_{safe}.mp3")
+                            asyncio.create_task(update_status_panel(gid))
                             if not state_exists(gs):
                                 _cancel_voice_worker(gid)
                                 asyncio.create_task(ensure_voice_disconnected(gid))
@@ -557,6 +594,7 @@ async def guild_scheduler(gid: int) -> None:
                                         )
                                     safe = re.sub(r"[^\w가-힣]", "_", name)[:20]
                                     play_event_audio(gid, f"{name} 자동 종료.", f"{gid}_as_{safe}.mp3")
+                                    asyncio.create_task(update_status_panel(gid))
                                     if not state_exists(gs):
                                         _cancel_voice_worker(gid)
                                         asyncio.create_task(ensure_voice_disconnected(gid))
@@ -568,6 +606,12 @@ async def guild_scheduler(gid: int) -> None:
                             await notify_transition(
                                 gid, t["channel_id"], name, new_mode
                             )
+                            asyncio.create_task(update_status_panel(gid))
+
+                # 3-1) Stats periodic save (~30초마다)
+                if gs["timers"] and ts - gs.get("_last_stats_save", 0) >= 30:
+                    gs["_last_stats_save"] = ts
+                    save_state()
 
                 # 4) 음성채널 연결 유지
                 if state_exists(gs) and gs.get("last_voice_channel_id"):
@@ -641,6 +685,8 @@ def parse_command(raw: str) -> list[dict]:
     우선순위:
       0) "도움말" / "help"               → help
       1) "상태"                          → status
+      1-1) "통계" / "통계 [이름]"       → stats
+      1-2) "출석"                        → attendance
       2) "종료"                          → shutdown_all
       2a) "음성채널 고정"                → voice_pin
       2b) "음성채널 해제"                → voice_unpin
@@ -674,6 +720,36 @@ def parse_command(raw: str) -> list[dict]:
         # 1) 상태
         if tok == "상태":
             actions.append({"type": "status"})
+            i += 1
+            continue
+
+        # 1-1) 통계 / 통계 [이름]
+        if tok == "통계":
+            if i + 1 < len(tokens):
+                actions.append({"type": "stats", "name": tokens[i + 1]})
+                i += 2
+            else:
+                actions.append({"type": "stats"})
+                i += 1
+            continue
+
+        # 1-2) 출석
+        if tok == "출석":
+            actions.append({"type": "attendance"})
+            i += 1
+            continue
+
+        # 1-3) 패널 / 패널 해제 / 패널 새로고침
+        if tok == "패널":
+            if i + 1 < len(tokens) and tokens[i + 1] == "해제":
+                actions.append({"type": "panel_off"})
+                i += 2
+                continue
+            if i + 1 < len(tokens) and tokens[i + 1] == "새로고침":
+                actions.append({"type": "panel_refresh"})
+                i += 2
+                continue
+            actions.append({"type": "panel"})
             i += 1
             continue
 
@@ -913,6 +989,245 @@ def build_status(gs: dict) -> str:
     return "\n".join(lines)
 
 
+# ── Stats / Attendance builders ───────────────────────────────────────────────
+
+def build_stats(gs: dict, name: str | None = None) -> str:
+    stats = gs.get("stats", {})
+    if name:
+        # 특정 사용자 최근 7일
+        lines = [f"📊 **{name} 통계**"]
+        today = datetime.now(KST).date()
+        total_study = 0.0
+        found = False
+        for d in range(7):
+            dt = today - timedelta(days=d)
+            dk = dt.strftime("%Y-%m-%d")
+            day = stats.get(dk, {})
+            entry = day.get(name)
+            if entry:
+                found = True
+                s = entry.get("study", 0)
+                r = entry.get("rest", 0)
+                total_study += s
+                label = "오늘" if d == 0 else dt.strftime("%m/%d")
+                lines.append(f"  • {label} — 공부 {_fmt_dur(int(s))} / 휴식 {_fmt_dur(int(r))}")
+        if not found:
+            lines.append("  기록 없음")
+        else:
+            lines.append(f"  **총 공부: {_fmt_dur(int(total_study))}**")
+        return "\n".join(lines)
+    else:
+        # 오늘 전체
+        today_key = datetime.now(KST).strftime("%Y-%m-%d")
+        day = stats.get(today_key, {})
+        if not day:
+            return f"📊 **오늘의 통계** ({today_key})\n  기록 없음"
+        lines = [f"📊 **오늘의 통계** ({today_key})"]
+        for uname, entry in sorted(day.items(), key=lambda x: x[1].get("study", 0), reverse=True):
+            s = entry.get("study", 0)
+            r = entry.get("rest", 0)
+            lines.append(f"  • **{uname}** 공부 {_fmt_dur(int(s))} / 휴식 {_fmt_dur(int(r))}")
+        return "\n".join(lines)
+
+
+def build_attendance(gs: dict) -> str:
+    today_key = datetime.now(KST).strftime("%Y-%m-%d")
+    stats = gs.get("stats", {})
+    day = stats.get(today_key, {})
+    lines = [f"📋 **출석부** ({today_key})"]
+    if not day:
+        lines.append("  기록 없음")
+    else:
+        for uname, entry in sorted(day.items(), key=lambda x: x[1].get("study", 0), reverse=True):
+            study_sec = entry.get("study", 0)
+            check = "✅" if study_sec >= 3600 else "❌"
+            lines.append(f"  {check} **{uname}** — {_fmt_dur(int(study_sec))}")
+    lines.append("  (기준: 공부 60분 이상)")
+    return "\n".join(lines)
+
+
+# ── Status Panel ──────────────────────────────────────────────────────────────
+
+def build_status_embed(gs: dict, gid: int) -> discord.Embed:
+    """패널용 Discord Embed 생성."""
+    ts = now_ts()
+    now_dt = datetime.now(KST)
+
+    # 색상: 일시정지 중이면 주황, 타이머 있으면 초록, 없으면 회색
+    if gs["pause_until"] is not None:
+        color = 0xFFA500
+    elif gs["timers"]:
+        color = 0x2ECC71
+    else:
+        color = 0x95A5A6
+
+    embed = discord.Embed(title="🏫 학교종 상태 패널", color=color)
+
+    # ── 개요 ──
+    overview_parts: list[str] = []
+    active = sum(
+        1 for t in gs["timers"].values()
+        if t.get("remaining_on_personal_pause") is None
+    )
+    paused = len(gs["timers"]) - active
+    overview_parts.append(f"타이머: {len(gs['timers'])}명 (활성 {active} / 정지 {paused})")
+    if gs["pause_until"] is not None:
+        rem = gs["pause_until"] - ts
+        edt = datetime.fromtimestamp(gs["pause_until"], tz=KST)
+        overview_parts.append(
+            f"⏸️ 일시정지 중 — {edt.strftime('%H:%M:%S')} 재개 "
+            f"(남은 {fmt_mm_ss(rem)})"
+        )
+    embed.add_field(name="📊 개요", value="\n".join(overview_parts), inline=False)
+
+    # ── 타이머 ──
+    if gs["timers"]:
+        timer_lines: list[str] = []
+        for name, t in gs["timers"].items():
+            ml = "공부" if t["mode"] == "study" else "휴식"
+            icon = "📗" if t["mode"] == "study" else "📙"
+            if t.get("remaining_on_personal_pause") is not None:
+                rem = t["remaining_on_personal_pause"]
+                status = "⏸️정지"
+            elif gs["pause_until"] is not None and t.get("remaining_on_pause") is not None:
+                rem = t["remaining_on_pause"]
+                status = "⏸️쉬는시간"
+            else:
+                rem = t["phase_end_at"] - ts
+                status = f"→{datetime.fromtimestamp(t['phase_end_at'], tz=KST).strftime('%H:%M:%S')}"
+            auto_info = ""
+            if t.get("_auto_stop_cycles") is not None:
+                auto_info += f" [{t.get('_cycle_count', 0)}/{t['_auto_stop_cycles']}회]"
+            if t.get("_auto_stop_ts") is not None:
+                _edt = datetime.fromtimestamp(t["_auto_stop_ts"], tz=KST)
+                auto_info += f" [끝{_edt.strftime('%H:%M')}]"
+            timer_lines.append(
+                f"{icon} **{name}** [{ml}] {fmt_mm_ss(rem)} {status}{auto_info}"
+            )
+        embed.add_field(
+            name=f"📋 타이머 ({len(gs['timers'])})",
+            value="\n".join(timer_lines),
+            inline=False,
+        )
+
+    # ── 쉬는시간 ──
+    all_breaks = gs["breaks"] + gs["recurring_breaks"]
+    if all_breaks:
+        brk_lines: list[str] = []
+        for b in gs["breaks"]:
+            nts = b.get("_next_ts") or next_occurrence_ts(b["hhmm"])
+            ndt = datetime.fromtimestamp(nts, tz=KST)
+            brk_lines.append(
+                f"🔔 **{b['label']}** {ndt.strftime('%m/%d %H:%M')} "
+                f"({_fmt_dur(b['duration_sec'])})"
+            )
+        for b in gs["recurring_breaks"]:
+            nts = b.get("_next_ts") or next_occurrence_ts(b["hhmm"])
+            ndt = datetime.fromtimestamp(nts, tz=KST)
+            brk_lines.append(
+                f"🔁 **{b['label']}** 매일 {b['hhmm']} "
+                f"({_fmt_dur(b['duration_sec'])}) "
+                f"→ {ndt.strftime('%m/%d %H:%M')}"
+            )
+        embed.add_field(
+            name=f"⏰ 쉬는시간 ({len(all_breaks)})",
+            value="\n".join(brk_lines),
+            inline=False,
+        )
+
+    # ── 오늘 통계 / 출석 ──
+    today_key = now_dt.strftime("%Y-%m-%d")
+    day = gs.get("stats", {}).get(today_key, {})
+    if day:
+        stat_lines: list[str] = []
+        for uname, entry in sorted(day.items(), key=lambda x: x[1].get("study", 0), reverse=True):
+            s = entry.get("study", 0)
+            r = entry.get("rest", 0)
+            check = "✅" if s >= 3600 else "❌"
+            stat_lines.append(
+                f"{check} **{uname}** 공부 {_fmt_dur(int(s))} / 휴식 {_fmt_dur(int(r))}"
+            )
+        embed.add_field(
+            name=f"📈 오늘 통계·출석 ({today_key})",
+            value="\n".join(stat_lines),
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=f"마지막 갱신: {now_dt.strftime('%H:%M:%S')} KST  |  10초마다 자동 갱신"
+    )
+    return embed
+
+
+async def fetch_status_panel_message(
+    gid: int, gs: dict
+) -> discord.Message | None:
+    """저장된 패널 메시지를 fetch. 실패 시 ID를 초기화하고 None 반환."""
+    ch_id = gs.get("status_panel_channel_id")
+    msg_id = gs.get("status_panel_message_id")
+    if not ch_id or not msg_id:
+        return None
+    ch = bot.get_channel(ch_id)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(ch_id)
+        except Exception:
+            gs["status_panel_channel_id"] = None
+            gs["status_panel_message_id"] = None
+            save_state()
+            return None
+    try:
+        return await ch.fetch_message(msg_id)  # type: ignore[union-attr]
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        gs["status_panel_channel_id"] = None
+        gs["status_panel_message_id"] = None
+        save_state()
+        return None
+
+
+async def update_status_panel(gid: int) -> None:
+    """패널 메시지를 현재 상태로 갱신. 메시지 없으면 무시."""
+    gs = guild_states.get(gid)
+    if gs is None:
+        return
+    panel_msg = await fetch_status_panel_message(gid, gs)
+    if panel_msg is None:
+        return
+    try:
+        embed = build_status_embed(gs, gid)
+        await panel_msg.edit(embed=embed)
+    except Exception:
+        log.exception("패널 갱신 실패 guild=%d", gid)
+
+
+async def panel_updater_loop(gid: int) -> None:
+    """10초마다 패널 자동 갱신 루프."""
+    log.info("패널 갱신 루프 시작 guild=%d", gid)
+    try:
+        while True:
+            await asyncio.sleep(10)
+            gs = guild_states.get(gid)
+            if gs is None or not gs.get("status_panel_message_id"):
+                break
+            await update_status_panel(gid)
+    except asyncio.CancelledError:
+        log.info("패널 갱신 루프 종료 guild=%d", gid)
+
+
+def ensure_panel_task(gid: int) -> None:
+    """패널 갱신 태스크가 없으면 시작."""
+    t = panel_tasks.get(gid)
+    if t is None or t.done():
+        panel_tasks[gid] = asyncio.create_task(panel_updater_loop(gid))
+
+
+def cancel_panel_task(gid: int) -> None:
+    """패널 갱신 태스크를 취소."""
+    t = panel_tasks.pop(gid, None)
+    if t and not t.done():
+        t.cancel()
+
+
 # ── Help builder ──────────────────────────────────────────────────────────────
 
 def build_help() -> str:
@@ -1011,12 +1326,37 @@ def build_help() -> str:
         "```\n"
         "• 자주 쓰는 명령을 이름으로 저장해두고 한 번에 실행합니다.\n"
         "\n"
-        "**12) 상태 출력**\n"
+        "**12) 통계**\n"
+        "```\n"
+        "--학교종 통계\n"
+        "--학교종 통계 김동희\n"
+        "```\n"
+        "• 전체: 오늘의 공부/휴식 시간 요약\n"
+        "• 개인: 최근 7일간 기록\n"
+        "• 봇이 켜져 있던 동안 실제 관측 시간만 집계합니다.\n"
+        "\n"
+        "**13) 출석**\n"
+        "```\n"
+        "--학교종 출석\n"
+        "```\n"
+        "• 오늘 공부 60분 이상이면 출석 ✅\n"
+        "\n"
+        "**14) 상태 패널** (Discord Embed, 자동 갱신)\n"
+        "```\n"
+        "--학교종 패널\n"
+        "--학교종 패널 해제\n"
+        "--학교종 패널 새로고침\n"
+        "```\n"
+        "• 패널: Embed 메시지를 생성하고 10초마다 자동 갱신합니다.\n"
+        "• 해제: 자동 갱신을 중지합니다.\n"
+        "• 새로고침: 즉시 패널을 갱신합니다.\n"
+        "\n"
+        "**15) 상태 출력**\n"
         "```\n"
         "--학교종 상태\n"
         "```\n"
         "\n"
-        "**13) 도움말**\n"
+        "**16) 도움말**\n"
         "```\n"
         "--학교종 도움말\n"
         "--학교종 help\n"
@@ -1072,6 +1412,9 @@ async def on_ready() -> None:
         if gs["pinned_voice_channel_id"]:
             gs["last_voice_channel_id"] = gs["pinned_voice_channel_id"]
         gs["presets"] = data.get("presets", {})
+        gs["stats"] = data.get("stats", {})
+        gs["status_panel_channel_id"] = data.get("status_panel_channel_id")
+        gs["status_panel_message_id"] = data.get("status_panel_message_id")
 
         # 쉬는시간 복구
         for b in data.get("breaks", []):
@@ -1104,10 +1447,15 @@ async def on_ready() -> None:
                 "_auto_stop_cycles":           None,
                 "_cycle_count":                0,
                 "_auto_stop_ts":               None,
+                "_last_accounted_at":          ts,
             }
 
         if gs["timers"] or gs["breaks"] or gs["recurring_breaks"]:
             ensure_scheduler(gid)
+
+        # 패널 복구
+        if gs.get("status_panel_message_id"):
+            ensure_panel_task(gid)
 
     log.info("준비 완료")
 
@@ -1159,8 +1507,52 @@ async def on_message(msg: discord.Message) -> None:
             elif atype == "status":
                 replies.append(build_status(gs))
 
+            # ── 통계 ──
+            elif atype == "stats":
+                replies.append(build_stats(gs, act.get("name")))
+
+            # ── 출석 ──
+            elif atype == "attendance":
+                replies.append(build_attendance(gs))
+
+            # ── 패널 ──
+            elif atype == "panel":
+                embed = build_status_embed(gs, gid)
+                panel_msg = await msg.channel.send(embed=embed)
+                gs["status_panel_channel_id"] = msg.channel.id
+                gs["status_panel_message_id"] = panel_msg.id
+                save_state()
+                ensure_panel_task(gid)
+                replies.append("✅ 상태 패널 생성 (10초마다 자동 갱신)")
+
+            # ── 패널 해제 ──
+            elif atype == "panel_off":
+                if gs.get("status_panel_message_id"):
+                    cancel_panel_task(gid)
+                    gs["status_panel_channel_id"] = None
+                    gs["status_panel_message_id"] = None
+                    save_state()
+                    replies.append("✅ 상태 패널 자동 갱신 해제")
+                else:
+                    replies.append("ℹ️ 활성화된 패널이 없습니다.")
+
+            # ── 패널 새로고침 ──
+            elif atype == "panel_refresh":
+                if gs.get("status_panel_message_id"):
+                    await update_status_panel(gid)
+                    replies.append("✅ 패널 새로고침 완료")
+                else:
+                    replies.append("ℹ️ 활성화된 패널이 없습니다.")
+
             # ── 전체 종료 ──
             elif atype == "shutdown_all":
+                _ts = now_ts()
+                if gs["pause_until"] is None:
+                    for _n, _t in gs["timers"].items():
+                        if _t.get("remaining_on_personal_pause") is None:
+                            _acc = _t.get("_last_accounted_at")
+                            if _acc is not None and _acc < _ts:
+                                _accumulate_stats(gs, _n, _t["mode"], _ts - _acc)
                 gs["timers"].clear()
                 gs["breaks"].clear()
                 gs["recurring_breaks"].clear()
@@ -1174,6 +1566,7 @@ async def on_message(msg: discord.Message) -> None:
                     task.cancel()
                 _cancel_voice_worker(gid)
                 asyncio.create_task(ensure_voice_disconnected(gid))
+                asyncio.create_task(update_status_panel(gid))
                 replies.append("✅ 전체 종료: 모든 타이머/쉬는시간 중지")
 
             # ── 쉬는시간 강제 종료 ──
@@ -1185,6 +1578,7 @@ async def on_message(msg: discord.Message) -> None:
                     for t in gs["timers"].values():
                         timer_resume(t)
                     await notify_resume(gid, gs)
+                    asyncio.create_task(update_status_panel(gid))
 
             # ── 음성채널 고정 ──
             elif atype == "voice_pin":
@@ -1218,9 +1612,15 @@ async def on_message(msg: discord.Message) -> None:
             elif atype == "stop":
                 name = act["name"]
                 if name in gs["timers"]:
+                    _st = gs["timers"][name]
+                    if gs["pause_until"] is None and _st.get("remaining_on_personal_pause") is None:
+                        _acc = _st.get("_last_accounted_at")
+                        if _acc is not None:
+                            _accumulate_stats(gs, name, _st["mode"], now_ts() - _acc)
                     del gs["timers"][name]
                     save_state()
                     replies.append(f"✅ **{name}** 타이머 종료")
+                    asyncio.create_task(update_status_panel(gid))
                     # 상태가 없어졌으면 음성도 해제
                     if not state_exists(gs):
                         _cancel_voice_worker(gid)
@@ -1244,6 +1644,7 @@ async def on_message(msg: discord.Message) -> None:
                     f"— {ndt.strftime('%m/%d %H:%M')} ({_fmt_dur(act['duration_sec'])})"
                 )
                 ensure_scheduler(gid)
+                asyncio.create_task(update_status_panel(gid))
 
             # ── 쉬는시간 목록 ──
             elif atype == "break_list":
@@ -1270,6 +1671,7 @@ async def on_message(msg: discord.Message) -> None:
                 if removed:
                     save_state()
                     replies.append(f"✅ 쉬는시간 **{label}** 삭제 ({removed}건)")
+                    asyncio.create_task(update_status_panel(gid))
                     if not state_exists(gs):
                         _cancel_voice_worker(gid)
                         asyncio.create_task(ensure_voice_disconnected(gid))
@@ -1293,6 +1695,7 @@ async def on_message(msg: discord.Message) -> None:
                     f"→ 다음: {ndt.strftime('%m/%d %H:%M')}"
                 )
                 ensure_scheduler(gid)
+                asyncio.create_task(update_status_panel(gid))
 
             # ── 정규쉬는시간 목록 ──
             elif atype == "recurring_break_list":
@@ -1319,6 +1722,7 @@ async def on_message(msg: discord.Message) -> None:
                 if removed:
                     save_state()
                     replies.append(f"✅ 정규쉬는시간 **{label}** 삭제 ({removed}건)")
+                    asyncio.create_task(update_status_panel(gid))
                     if not state_exists(gs):
                         _cancel_voice_worker(gid)
                         asyncio.create_task(ensure_voice_disconnected(gid))
@@ -1377,11 +1781,17 @@ async def on_message(msg: discord.Message) -> None:
                 elif t.get("remaining_on_personal_pause") is not None:
                     replies.append(f"ℹ️ **{name}** 이미 일시정지 중입니다.")
                 else:
+                    if gs["pause_until"] is None:
+                        _acc = t.get("_last_accounted_at")
+                        if _acc is not None:
+                            _accumulate_stats(gs, name, t["mode"], now_ts() - _acc)
+                        t["_last_accounted_at"] = now_ts()
                     timer_personal_pause(t, gs)
                     replies.append(
                         f"⏸️ **{name}** 일시정지 "
                         f"(남은 시간 {fmt_mm_ss(t['remaining_on_personal_pause'])} 저장)"
                     )
+                    asyncio.create_task(update_status_panel(gid))
 
             # ── 개인 재개 ──
             elif atype == "personal_resume":
@@ -1393,6 +1803,7 @@ async def on_message(msg: discord.Message) -> None:
                     replies.append(f"ℹ️ **{name}** 일시정지 상태가 아닙니다.")
                 else:
                     timer_personal_resume(t, gs)
+                    t["_last_accounted_at"] = now_ts()
                     if gs["pause_until"] is not None:
                         replies.append(
                             f"▶️ **{name}** 개인 일시정지 해제 "
@@ -1403,6 +1814,7 @@ async def on_message(msg: discord.Message) -> None:
                         replies.append(
                             f"▶️ **{name}** 재개 → {edt.strftime('%H:%M:%S')}"
                         )
+                    asyncio.create_task(update_status_panel(gid))
 
             # ── 남은시간 수정 ──
             elif atype == "set_remaining":
@@ -1429,6 +1841,7 @@ async def on_message(msg: discord.Message) -> None:
                             f"✅ **{name}** 남은시간 → {_fmt_dur(new_sec)} "
                             f"(전환 {edt.strftime('%H:%M:%S')})"
                         )
+                    asyncio.create_task(update_status_panel(gid))
 
             # ── 개인 타이머 시작/재설정 ──
             elif atype == "timer":
@@ -1450,6 +1863,7 @@ async def on_message(msg: discord.Message) -> None:
                     "_auto_stop_cycles":           act.get("auto_stop_cycles"),
                     "_cycle_count":                0,
                     "_auto_stop_ts":               _as_ts,
+                    "_last_accounted_at":           ts_now,
                 }
                 if gs["pause_until"] is not None:
                     timer_pause(entry)
@@ -1476,6 +1890,7 @@ async def on_message(msg: discord.Message) -> None:
                         + suffix
                     )
                 ensure_scheduler(gid)
+                asyncio.create_task(update_status_panel(gid))
 
         # 상태가 있는데 음성채널 미설정이면 1회만 안내
         if (
