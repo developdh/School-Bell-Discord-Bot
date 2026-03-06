@@ -11,17 +11,25 @@ from pathlib import Path
 import discord
 
 from app.config import KST, PREFIX, TTS_CACHE, _BASE_DIR, _FFMPEG, log
+from app.domain.commands import (
+    AddBreakCommand, AttendanceCommand, BreakDeleteCommand,
+    BreakEndCommand, BreakListCommand, ClosePanelCommand,
+    HelpCommand, OpenPanelCommand, PersonalPauseCommand,
+    PersonalResumeCommand, PresetDeleteCommand, PresetListCommand,
+    PresetRunCommand, PresetSaveCommand, RecurringBreakAddCommand,
+    RecurringBreakDeleteCommand, RecurringBreakListCommand,
+    RefreshPanelCommand, SetRemainingCommand, SetTimerCommand,
+    ShutdownAllCommand, StatusCommand, StatsCommand, StopTimerCommand,
+    VoicePinCommand, VoiceUnpinCommand,
+)
 from app.domain.models import BreakEntry, GuildState, Timer
+from app.parsers.command_parser import parse_command
 from app.repositories.state_repository import load_state, save_state
 from app.utils.time_utils import (
-    _RE_HHMM,
-    _RE_REPEAT,
-    dur_tok,
     fmt_dur,
     fmt_mm_ss,
     next_occurrence_ts,
     now_ts,
-    time_tok,
 )
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
@@ -478,221 +486,6 @@ def ensure_scheduler(gid: int) -> None:
     t = guild_tasks.get(gid)
     if t is None or t.done():
         guild_tasks[gid] = asyncio.create_task(guild_scheduler(gid))
-
-
-# ── Parser ────────────────────────────────────────────────────────────────────
-
-def parse_command(raw: str) -> list[dict]:
-    """공백 토큰 기반 왼쪽부터 순차 파싱. 반환: 액션 리스트."""
-    tokens = raw.strip().split()
-    actions: list[dict] = []
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-
-        # 0) 도움말 / help
-        if tok == "도움말" or tok.lower() == "help":
-            actions.append({"type": "help"})
-            i += 1
-            continue
-
-        # 1) 상태
-        if tok == "상태":
-            actions.append({"type": "status"})
-            i += 1
-            continue
-
-        # 1-1) 통계 / 통계 [이름]
-        if tok == "통계":
-            if i + 1 < len(tokens):
-                actions.append({"type": "stats", "name": tokens[i + 1]})
-                i += 2
-            else:
-                actions.append({"type": "stats"})
-                i += 1
-            continue
-
-        # 1-2) 출석
-        if tok == "출석":
-            actions.append({"type": "attendance"})
-            i += 1
-            continue
-
-        # 1-3) 패널 / 패널 해제 / 패널 새로고침
-        if tok == "패널":
-            if i + 1 < len(tokens) and tokens[i + 1] == "해제":
-                actions.append({"type": "panel_off"})
-                i += 2
-                continue
-            if i + 1 < len(tokens) and tokens[i + 1] == "새로고침":
-                actions.append({"type": "panel_refresh"})
-                i += 2
-                continue
-            actions.append({"type": "panel"})
-            i += 1
-            continue
-
-        # 2) 전체 종료
-        if tok == "종료":
-            actions.append({"type": "shutdown_all"})
-            i += 1
-            continue
-
-        # 2a) 음성채널 고정 / 해제
-        if tok == "음성채널" and i + 1 < len(tokens):
-            sub = tokens[i + 1]
-            if sub == "고정":
-                actions.append({"type": "voice_pin"})
-                i += 2
-                continue
-            if sub == "해제":
-                actions.append({"type": "voice_unpin"})
-                i += 2
-                continue
-
-        # 2c-f) 프리셋
-        if tok == "프리셋" and i + 1 < len(tokens):
-            sub = tokens[i + 1]
-            if sub == "저장" and i + 3 < len(tokens):
-                pname = tokens[i + 2]
-                content = " ".join(tokens[i + 3:])
-                actions.append({"type": "preset_save", "name": pname, "content": content})
-                i = len(tokens)
-                continue
-            if sub == "실행" and i + 2 < len(tokens):
-                actions.append({"type": "preset_run", "name": tokens[i + 2]})
-                i += 3
-                continue
-            if sub == "목록":
-                actions.append({"type": "preset_list"})
-                i += 2
-                continue
-            if sub == "삭제" and i + 2 < len(tokens):
-                actions.append({"type": "preset_delete", "name": tokens[i + 2]})
-                i += 3
-                continue
-
-        # 3) 쉬는시간 강제 종료
-        if tok == "쉬는시간" and i + 1 < len(tokens) and tokens[i + 1] == "끝":
-            actions.append({"type": "break_end"})
-            i += 2
-            continue
-
-        # 3a) 쉬는시간 목록
-        if tok == "쉬는시간" and i + 1 < len(tokens) and tokens[i + 1] == "목록":
-            actions.append({"type": "break_list"})
-            i += 2
-            continue
-
-        # 3b) 쉬는시간 삭제
-        if tok == "쉬는시간" and i + 2 < len(tokens) and tokens[i + 1] == "삭제":
-            actions.append({"type": "break_delete", "label": tokens[i + 2]})
-            i += 3
-            continue
-
-        # 3b-2) 정규쉬는시간 추가/목록/삭제
-        if tok == "정규쉬는시간" and i + 1 < len(tokens):
-            sub = tokens[i + 1]
-            if sub == "추가" and i + 4 < len(tokens):
-                label, hhmm, dur_s = tokens[i + 2], tokens[i + 3], tokens[i + 4]
-                if _RE_HHMM.match(hhmm):
-                    dur = dur_tok(dur_s)
-                    if dur is not None:
-                        actions.append({
-                            "type":         "recurring_break_add",
-                            "label":        label,
-                            "hhmm":         hhmm,
-                            "duration_sec": dur,
-                        })
-                        i += 5
-                        continue
-            if sub == "목록":
-                actions.append({"type": "recurring_break_list"})
-                i += 2
-                continue
-            if sub == "삭제" and i + 2 < len(tokens):
-                actions.append({"type": "recurring_break_delete", "label": tokens[i + 2]})
-                i += 3
-                continue
-
-        # 3c) 일시정지 [이름]
-        if tok == "일시정지" and i + 1 < len(tokens):
-            actions.append({"type": "personal_pause", "name": tokens[i + 1]})
-            i += 2
-            continue
-
-        # 3d) 재개 [이름]
-        if tok == "재개" and i + 1 < len(tokens):
-            actions.append({"type": "personal_resume", "name": tokens[i + 1]})
-            i += 2
-            continue
-
-        # 3e) 남은시간 [이름] [N분]
-        if tok == "남은시간" and i + 2 < len(tokens):
-            dur = dur_tok(tokens[i + 2])
-            if dur is not None:
-                actions.append({"type": "set_remaining", "name": tokens[i + 1], "seconds": dur})
-                i += 3
-                continue
-
-        # 4) [이름] 종료
-        if i + 1 < len(tokens) and tokens[i + 1] == "종료":
-            actions.append({"type": "stop", "name": tok})
-            i += 2
-            continue
-
-        # 5) 쉬는시간 [라벨] HH:MM [N분]
-        if tok == "쉬는시간" and i + 3 < len(tokens):
-            label, hhmm, dur_s = tokens[i + 1], tokens[i + 2], tokens[i + 3]
-            if _RE_HHMM.match(hhmm):
-                dur = dur_tok(dur_s)
-                if dur is not None:
-                    actions.append({
-                        "type":         "break",
-                        "label":        label,
-                        "hhmm":         hhmm,
-                        "duration_sec": dur,
-                    })
-                    i += 4
-                    continue
-
-        # 6) [이름] [N분공부] [M분휴식] [N회반복]? [오늘끝 HH:MM]?
-        if i + 2 < len(tokens):
-            r1 = time_tok(tokens[i + 1])
-            r2 = time_tok(tokens[i + 2])
-            if r1 and r2 and r1[0] != r2[0]:
-                study = r1[1] if r1[0] == "study" else r2[1]
-                rest  = r2[1] if r2[0] == "rest"  else r1[1]
-                i += 3
-                auto_cycles   = None
-                auto_end_hhmm = None
-                while i < len(tokens):
-                    rm = _RE_REPEAT.match(tokens[i])
-                    if rm:
-                        auto_cycles = int(rm.group(1))
-                        i += 1
-                        continue
-                    if tokens[i] == "오늘끝" and i + 1 < len(tokens) and _RE_HHMM.match(tokens[i + 1]):
-                        auto_end_hhmm = tokens[i + 1]
-                        i += 2
-                        continue
-                    break
-                act_d: dict = {
-                    "type":      "timer",
-                    "name":      tok,
-                    "study_sec": study,
-                    "rest_sec":  rest,
-                }
-                if auto_cycles is not None:
-                    act_d["auto_stop_cycles"] = auto_cycles
-                if auto_end_hhmm is not None:
-                    act_d["auto_stop_hhmm"] = auto_end_hhmm
-                actions.append(act_d)
-                continue
-
-        i += 1  # 인식 불가 토큰 → 건너뜀
-
-    return actions
 
 
 # ── Status builder ────────────────────────────────────────────────────────────
@@ -1239,27 +1032,26 @@ async def on_message(msg: discord.Message) -> None:
         gs.last_channel_id = cid
         replies: list[str] = []
 
-        for act in actions:
-            atype = act["type"]
+        for cmd in actions:
 
             # ── 도움말 ──
-            if atype == "help":
+            if isinstance(cmd, HelpCommand):
                 replies.append(build_help())
 
             # ── 상태 ──
-            elif atype == "status":
+            elif isinstance(cmd, StatusCommand):
                 replies.append(build_status(gs))
 
             # ── 통계 ──
-            elif atype == "stats":
-                replies.append(build_stats(gs, act.get("name")))
+            elif isinstance(cmd, StatsCommand):
+                replies.append(build_stats(gs, cmd.name))
 
             # ── 출석 ──
-            elif atype == "attendance":
+            elif isinstance(cmd, AttendanceCommand):
                 replies.append(build_attendance(gs))
 
             # ── 패널 ──
-            elif atype == "panel":
+            elif isinstance(cmd, OpenPanelCommand):
                 embed = build_status_embed(gs, gid)
                 panel_msg = await msg.channel.send(embed=embed)
                 gs.status_panel_channel_id = msg.channel.id
@@ -1269,7 +1061,7 @@ async def on_message(msg: discord.Message) -> None:
                 replies.append("✅ 상태 패널 생성 (10초마다 자동 갱신)")
 
             # ── 패널 해제 ──
-            elif atype == "panel_off":
+            elif isinstance(cmd, ClosePanelCommand):
                 if gs.status_panel_message_id:
                     cancel_panel_task(gid)
                     gs.status_panel_channel_id = None
@@ -1280,7 +1072,7 @@ async def on_message(msg: discord.Message) -> None:
                     replies.append("ℹ️ 활성화된 패널이 없습니다.")
 
             # ── 패널 새로고침 ──
-            elif atype == "panel_refresh":
+            elif isinstance(cmd, RefreshPanelCommand):
                 if gs.status_panel_message_id:
                     await update_status_panel(gid)
                     replies.append("✅ 패널 새로고침 완료")
@@ -1288,7 +1080,7 @@ async def on_message(msg: discord.Message) -> None:
                     replies.append("ℹ️ 활성화된 패널이 없습니다.")
 
             # ── 전체 종료 ──
-            elif atype == "shutdown_all":
+            elif isinstance(cmd, ShutdownAllCommand):
                 _ts = now_ts()
                 if gs.pause_until is None:
                     for _n, _t in gs.timers.items():
@@ -1312,7 +1104,7 @@ async def on_message(msg: discord.Message) -> None:
                 replies.append("✅ 전체 종료: 모든 타이머/쉬는시간 중지")
 
             # ── 쉬는시간 강제 종료 ──
-            elif atype == "break_end":
+            elif isinstance(cmd, BreakEndCommand):
                 if gs.pause_until is None:
                     replies.append("ℹ️ 현재 일시정지 중이 아닙니다")
                 else:
@@ -1323,7 +1115,7 @@ async def on_message(msg: discord.Message) -> None:
                     asyncio.create_task(update_status_panel(gid))
 
             # ── 음성채널 고정 ──
-            elif atype == "voice_pin":
+            elif isinstance(cmd, VoicePinCommand):
                 if (
                     msg.guild
                     and hasattr(msg.author, "voice")
@@ -1339,7 +1131,7 @@ async def on_message(msg: discord.Message) -> None:
                     replies.append("❌ 음성채널에 먼저 접속해주세요.")
 
             # ── 음성채널 해제 ──
-            elif atype == "voice_unpin":
+            elif isinstance(cmd, VoiceUnpinCommand):
                 if gs.pinned_voice_channel_id:
                     gs.pinned_voice_channel_id = None
                     gs.last_voice_channel_id   = None
@@ -1351,8 +1143,8 @@ async def on_message(msg: discord.Message) -> None:
                     replies.append("ℹ️ 고정된 음성채널이 없습니다.")
 
             # ── 종료 ──
-            elif atype == "stop":
-                name = act["name"]
+            elif isinstance(cmd, StopTimerCommand):
+                name = cmd.name
                 if name in gs.timers:
                     _st = gs.timers[name]
                     if gs.pause_until is None and _st.remaining_on_personal_pause is None:
@@ -1369,25 +1161,25 @@ async def on_message(msg: discord.Message) -> None:
                     replies.append(f"❌ **{name}** 타이머 없음")
 
             # ── 쉬는시간 등록 ──
-            elif atype == "break":
+            elif isinstance(cmd, AddBreakCommand):
                 brk = BreakEntry(
-                    label=act["label"],
-                    hhmm=act["hhmm"],
-                    duration_sec=act["duration_sec"],
-                    next_ts=next_occurrence_ts(act["hhmm"]),
+                    label=cmd.label,
+                    hhmm=cmd.hhmm,
+                    duration_sec=cmd.duration_sec,
+                    next_ts=next_occurrence_ts(cmd.hhmm),
                 )
                 gs.breaks.append(brk)
                 _save()
                 ndt = datetime.fromtimestamp(brk.next_ts, tz=KST)
                 replies.append(
-                    f"✅ 쉬는시간 **{act['label']}** 등록 "
-                    f"— {ndt.strftime('%m/%d %H:%M')} ({fmt_dur(act['duration_sec'])})"
+                    f"✅ 쉬는시간 **{cmd.label}** 등록 "
+                    f"— {ndt.strftime('%m/%d %H:%M')} ({fmt_dur(cmd.duration_sec)})"
                 )
                 ensure_scheduler(gid)
                 asyncio.create_task(update_status_panel(gid))
 
             # ── 쉬는시간 목록 ──
-            elif atype == "break_list":
+            elif isinstance(cmd, BreakListCommand):
                 if gs.breaks:
                     lines = ["**🔔 쉬는시간 목록**"]
                     for idx, b in enumerate(gs.breaks, 1):
@@ -1403,8 +1195,8 @@ async def on_message(msg: discord.Message) -> None:
                     replies.append("🔔 등록된 쉬는시간이 없습니다.")
 
             # ── 쉬는시간 삭제 ──
-            elif atype == "break_delete":
-                label = act["label"]
+            elif isinstance(cmd, BreakDeleteCommand):
+                label = cmd.label
                 before = len(gs.breaks)
                 gs.breaks = [b for b in gs.breaks if b.label != label]
                 removed = before - len(gs.breaks)
@@ -1419,26 +1211,26 @@ async def on_message(msg: discord.Message) -> None:
                     replies.append(f"❌ **{label}** 쉬는시간을 찾을 수 없습니다.")
 
             # ── 정규쉬는시간 추가 ──
-            elif atype == "recurring_break_add":
+            elif isinstance(cmd, RecurringBreakAddCommand):
                 brk = BreakEntry(
-                    label=act["label"],
-                    hhmm=act["hhmm"],
-                    duration_sec=act["duration_sec"],
-                    next_ts=next_occurrence_ts(act["hhmm"]),
+                    label=cmd.label,
+                    hhmm=cmd.hhmm,
+                    duration_sec=cmd.duration_sec,
+                    next_ts=next_occurrence_ts(cmd.hhmm),
                 )
                 gs.recurring_breaks.append(brk)
                 _save()
                 ndt = datetime.fromtimestamp(brk.next_ts, tz=KST)
                 replies.append(
-                    f"✅ 정규쉬는시간 **{act['label']}** 등록 "
-                    f"— 매일 {act['hhmm']} ({fmt_dur(act['duration_sec'])}) "
+                    f"✅ 정규쉬는시간 **{cmd.label}** 등록 "
+                    f"— 매일 {cmd.hhmm} ({fmt_dur(cmd.duration_sec)}) "
                     f"→ 다음: {ndt.strftime('%m/%d %H:%M')}"
                 )
                 ensure_scheduler(gid)
                 asyncio.create_task(update_status_panel(gid))
 
             # ── 정규쉬는시간 목록 ──
-            elif atype == "recurring_break_list":
+            elif isinstance(cmd, RecurringBreakListCommand):
                 if gs.recurring_breaks:
                     lines = ["**🔁 정규쉬는시간 목록**"]
                     for idx, b in enumerate(gs.recurring_breaks, 1):
@@ -1454,8 +1246,8 @@ async def on_message(msg: discord.Message) -> None:
                     replies.append("🔁 등록된 정규쉬는시간이 없습니다.")
 
             # ── 정규쉬는시간 삭제 ──
-            elif atype == "recurring_break_delete":
-                label = act["label"]
+            elif isinstance(cmd, RecurringBreakDeleteCommand):
+                label = cmd.label
                 before = len(gs.recurring_breaks)
                 gs.recurring_breaks = [b for b in gs.recurring_breaks if b.label != label]
                 removed = before - len(gs.recurring_breaks)
@@ -1470,27 +1262,25 @@ async def on_message(msg: discord.Message) -> None:
                     replies.append(f"❌ **{label}** 정규쉬는시간을 찾을 수 없습니다.")
 
             # ── 프리셋 저장 ──
-            elif atype == "preset_save":
-                pname = act["name"]
-                gs.presets[pname] = act["content"]
+            elif isinstance(cmd, PresetSaveCommand):
+                gs.presets[cmd.name] = cmd.content
                 _save()
-                replies.append(f"✅ 프리셋 **{pname}** 저장: `{act['content']}`")
+                replies.append(f"✅ 프리셋 **{cmd.name}** 저장: `{cmd.content}`")
 
             # ── 프리셋 실행 ──
-            elif atype == "preset_run":
-                pname = act["name"]
-                if pname not in gs.presets:
-                    replies.append(f"❌ **{pname}** 프리셋 없음")
+            elif isinstance(cmd, PresetRunCommand):
+                if cmd.name not in gs.presets:
+                    replies.append(f"❌ **{cmd.name}** 프리셋 없음")
                 else:
-                    sub = parse_command(gs.presets[pname])
+                    sub = parse_command(gs.presets[cmd.name])
                     if sub:
                         actions.extend(sub)
-                        replies.append(f"▶️ 프리셋 **{pname}** 실행")
+                        replies.append(f"▶️ 프리셋 **{cmd.name}** 실행")
                     else:
-                        replies.append(f"❌ **{pname}** 프리셋 내용 인식 실패")
+                        replies.append(f"❌ **{cmd.name}** 프리셋 내용 인식 실패")
 
             # ── 프리셋 목록 ──
-            elif atype == "preset_list":
+            elif isinstance(cmd, PresetListCommand):
                 if gs.presets:
                     lines = ["**📦 프리셋 목록**"]
                     for idx, (pn, pc) in enumerate(gs.presets.items(), 1):
@@ -1500,18 +1290,17 @@ async def on_message(msg: discord.Message) -> None:
                     replies.append("📦 등록된 프리셋이 없습니다.")
 
             # ── 프리셋 삭제 ──
-            elif atype == "preset_delete":
-                pname = act["name"]
-                if pname in gs.presets:
-                    del gs.presets[pname]
+            elif isinstance(cmd, PresetDeleteCommand):
+                if cmd.name in gs.presets:
+                    del gs.presets[cmd.name]
                     _save()
-                    replies.append(f"✅ 프리셋 **{pname}** 삭제")
+                    replies.append(f"✅ 프리셋 **{cmd.name}** 삭제")
                 else:
-                    replies.append(f"❌ **{pname}** 프리셋 없음")
+                    replies.append(f"❌ **{cmd.name}** 프리셋 없음")
 
             # ── 개인 일시정지 ──
-            elif atype == "personal_pause":
-                name = act["name"]
+            elif isinstance(cmd, PersonalPauseCommand):
+                name = cmd.name
                 t = gs.timers.get(name)
                 if t is None:
                     replies.append(f"❌ **{name}** 타이머 없음")
@@ -1530,8 +1319,8 @@ async def on_message(msg: discord.Message) -> None:
                     asyncio.create_task(update_status_panel(gid))
 
             # ── 개인 재개 ──
-            elif atype == "personal_resume":
-                name = act["name"]
+            elif isinstance(cmd, PersonalResumeCommand):
+                name = cmd.name
                 t = gs.timers.get(name)
                 if t is None:
                     replies.append(f"❌ **{name}** 타이머 없음")
@@ -1553,9 +1342,9 @@ async def on_message(msg: discord.Message) -> None:
                     asyncio.create_task(update_status_panel(gid))
 
             # ── 남은시간 수정 ──
-            elif atype == "set_remaining":
-                name = act["name"]
-                new_sec = act["seconds"]
+            elif isinstance(cmd, SetRemainingCommand):
+                name = cmd.name
+                new_sec = cmd.seconds
                 t = gs.timers.get(name)
                 if t is None:
                     replies.append(f"❌ **{name}** 타이머 없음")
@@ -1580,43 +1369,43 @@ async def on_message(msg: discord.Message) -> None:
                     asyncio.create_task(update_status_panel(gid))
 
             # ── 개인 타이머 시작/재설정 ──
-            elif atype == "timer":
+            elif isinstance(cmd, SetTimerCommand):
                 ts_now = now_ts()
                 _as_ts = None
-                if act.get("auto_stop_hhmm"):
+                if cmd.auto_stop_hhmm:
                     _now = datetime.now(KST)
-                    _h, _m = map(int, act["auto_stop_hhmm"].split(":"))
+                    _h, _m = map(int, cmd.auto_stop_hhmm.split(":"))
                     _as_ts = _now.replace(hour=_h, minute=_m, second=0, microsecond=0).timestamp()
                 entry = Timer(
-                    study_sec=act["study_sec"],
-                    rest_sec=act["rest_sec"],
+                    study_sec=cmd.study_sec,
+                    rest_sec=cmd.rest_sec,
                     channel_id=cid,
                     mode="study",
-                    phase_end_at=ts_now + act["study_sec"],
-                    auto_stop_cycles=act.get("auto_stop_cycles"),
+                    phase_end_at=ts_now + cmd.study_sec,
+                    auto_stop_cycles=cmd.auto_stop_cycles,
                     auto_stop_ts=_as_ts,
                     last_accounted_at=ts_now,
                 )
                 if gs.pause_until is not None:
                     timer_pause(entry)
-                gs.timers[act["name"]] = entry
+                gs.timers[cmd.name] = entry
                 _save()
                 suffix = ""
-                if act.get("auto_stop_cycles"):
-                    suffix += f" | {act['auto_stop_cycles']}회 반복"
-                if act.get("auto_stop_hhmm"):
-                    suffix += f" | 오늘 {act['auto_stop_hhmm']} 종료"
+                if cmd.auto_stop_cycles:
+                    suffix += f" | {cmd.auto_stop_cycles}회 반복"
+                if cmd.auto_stop_hhmm:
+                    suffix += f" | 오늘 {cmd.auto_stop_hhmm} 종료"
                 if gs.pause_until is not None:
                     replies.append(
-                        f"✅ **{act['name']}** 타이머 등록 (현재 일시정지 중 — 재개 후 공부 시작) "
-                        f"공부 {act['study_sec'] // 60}분 / 휴식 {act['rest_sec'] // 60}분"
+                        f"✅ **{cmd.name}** 타이머 등록 (현재 일시정지 중 — 재개 후 공부 시작) "
+                        f"공부 {cmd.study_sec // 60}분 / 휴식 {cmd.rest_sec // 60}분"
                         + suffix
                     )
                 else:
                     edt = datetime.fromtimestamp(entry.phase_end_at, tz=KST)
                     replies.append(
-                        f"✅ **{act['name']}** 타이머 시작 "
-                        f"— 공부 {act['study_sec'] // 60}분 / 휴식 {act['rest_sec'] // 60}분, "
+                        f"✅ **{cmd.name}** 타이머 시작 "
+                        f"— 공부 {cmd.study_sec // 60}분 / 휴식 {cmd.rest_sec // 60}분, "
                         f"첫 전환 {edt.strftime('%H:%M:%S')}"
                         + suffix
                     )
