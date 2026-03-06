@@ -40,8 +40,8 @@ for f in glob.glob(os.path.join(_nacl_pkg_dir, '**', '*.dll'), recursive=True):
 print(f"[spec] total nacl_binaries: {len(nacl_binaries)}")
 
 a = Analysis(
-    ["bot.py"],
-    pathex=[],
+    ["app/main.py"],
+    pathex=["."],
     binaries=[("ffmpeg.exe", ".")] + nacl_binaries,
     datas=[] + nacl_datas,
     hiddenimports=[
