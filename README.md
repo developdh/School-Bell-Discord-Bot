@@ -60,6 +60,30 @@ DISCORD_TOKEN=여기에_봇_토큰
 python bot.py
 ```
 
+## 프로젝트 구조
+
+```
+app/
+├── main.py                          # 엔트리포인트 (.env, 토큰)
+├── config.py                        # 상수, 로깅, 경로
+├── bot/
+│   └── client.py                    # Discord 클라이언트, 이벤트 핸들러, 알림, 음성, 패널
+├── domain/
+│   ├── models.py                    # Timer, BreakEntry, GuildState 데이터클래스
+│   └── commands.py                  # 커맨드 데이터클래스
+├── services/
+│   ├── guild_state_service.py       # 길드별 상태·락·태스크 레지스트리
+│   ├── scheduler_service.py         # 길드별 스케줄러 루프 (타이머 전환, 쉬는시간, auto-stop)
+│   ├── timer_service.py             # 타이머 상태 조작 및 커맨드 핸들러
+│   └── break_service.py             # 쉬는시간 CRUD
+├── parsers/
+│   └── command_parser.py            # 토큰 기반 명령어 파서
+├── repositories/
+│   └── state_repository.py          # state.json 읽기/쓰기
+└── utils/
+    └── time_utils.py                # KST 시간, 포맷, 파싱 유틸
+```
+
 ## 음성 안내 설정
 
 1. `bell.mp3` (종소리 파일)을 `bot.py` 옆에 배치 — 없으면 TTS만 재생
