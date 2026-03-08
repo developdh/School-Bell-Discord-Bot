@@ -25,6 +25,16 @@ from app.domain.commands import (
 from app.domain.models import BreakEntry, GuildState, Timer
 from app.parsers.command_parser import parse_command
 from app.repositories.state_repository import load_state, save_state
+from app.services import break_service, timer_service
+from app.services.guild_state_service import (
+    get_guild_state,
+    guild_locks,
+    guild_states,
+    guild_tasks,
+    panel_tasks,
+    voice_queues,
+    voice_workers,
+)
 from app.utils.time_utils import (
     fmt_dur,
     fmt_mm_ss,
@@ -32,68 +42,9 @@ from app.utils.time_utils import (
     now_ts,
 )
 
-# ── Runtime state ─────────────────────────────────────────────────────────────
-guild_states:  dict[int, GuildState]    = {}
-guild_locks:   dict[int, asyncio.Lock]  = {}
-guild_tasks:   dict[int, asyncio.Task]  = {}
-voice_queues:  dict[int, asyncio.Queue] = {}
-voice_workers: dict[int, asyncio.Task]  = {}
-panel_tasks:   dict[int, asyncio.Task]  = {}
-
-
-def get_guild_state(gid: int) -> GuildState:
-    if gid not in guild_states:
-        guild_states[gid] = GuildState()
-        guild_locks[gid]  = asyncio.Lock()
-        voice_queues[gid] = asyncio.Queue()
-    return guild_states[gid]
-
-
 def _save() -> None:
     """guild_states를 JSON에 저장하는 단축 호출."""
     save_state(guild_states)
-
-
-# ── Timer ops ─────────────────────────────────────────────────────────────────
-
-def timer_pause(timer: Timer) -> None:
-    if timer.remaining_on_personal_pause is not None:
-        return
-    timer.remaining_on_pause = max(0.0, timer.phase_end_at - now_ts())
-
-
-def timer_resume(timer: Timer) -> None:
-    if timer.remaining_on_personal_pause is not None:
-        return
-    rem = timer.remaining_on_pause or 0.0
-    timer.phase_end_at       = now_ts() + rem
-    timer.remaining_on_pause = None
-
-
-def timer_personal_pause(timer: Timer, gs: GuildState) -> None:
-    if gs.pause_until is not None and timer.remaining_on_pause is not None:
-        timer.remaining_on_personal_pause = timer.remaining_on_pause
-        timer.remaining_on_pause = None
-    else:
-        timer.remaining_on_personal_pause = max(0.0, timer.phase_end_at - now_ts())
-
-
-def timer_personal_resume(timer: Timer, gs: GuildState) -> None:
-    rem = timer.remaining_on_personal_pause or 0.0
-    timer.remaining_on_personal_pause = None
-    if gs.pause_until is not None:
-        timer.remaining_on_pause = rem
-    else:
-        timer.phase_end_at = now_ts() + rem
-
-
-def _accumulate_stats(gs: GuildState, name: str, mode: str, seconds: float) -> None:
-    if seconds <= 0:
-        return
-    date_key = datetime.now(KST).strftime("%Y-%m-%d")
-    day = gs.stats.setdefault(date_key, {})
-    entry = day.setdefault(name, {"study": 0.0, "rest": 0.0})
-    entry["study" if mode == "study" else "rest"] += seconds
 
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
@@ -383,10 +334,10 @@ async def guild_scheduler(gid: int) -> None:
                             for _n, _t in gs.timers.items():
                                 if _t.remaining_on_personal_pause is None:
                                     if _t.last_accounted_at > 0 and _t.last_accounted_at < ts:
-                                        _accumulate_stats(gs, _n, _t.mode, ts - _t.last_accounted_at)
+                                        timer_service.accumulate_stats(gs, _n, _t.mode, ts - _t.last_accounted_at)
                                     _t.last_accounted_at = ts
                             for t in gs.timers.values():
-                                timer_pause(t)
+                                timer_service.timer_pause(t)
                         gs.pause_until = end_ts
                         await notify_break_event(gid, gs, brk, end_ts, already)
                         asyncio.create_task(update_status_panel(gid))
@@ -396,7 +347,7 @@ async def guild_scheduler(gid: int) -> None:
                 if gs.pause_until is not None and ts >= gs.pause_until:
                     gs.pause_until = None
                     for t in gs.timers.values():
-                        timer_resume(t)
+                        timer_service.timer_resume(t)
                         t.last_accounted_at = ts
                     await notify_resume(gid, gs)
                     asyncio.create_task(update_status_panel(gid))
@@ -409,7 +360,7 @@ async def guild_scheduler(gid: int) -> None:
 
                         # Stats accumulation
                         if t.last_accounted_at > 0 and t.last_accounted_at < ts:
-                            _accumulate_stats(gs, name, t.mode, ts - t.last_accounted_at)
+                            timer_service.accumulate_stats(gs, name, t.mode, ts - t.last_accounted_at)
                         t.last_accounted_at = ts
 
                         # Auto-stop: 시간 제한
@@ -1081,36 +1032,20 @@ async def on_message(msg: discord.Message) -> None:
 
             # ── 전체 종료 ──
             elif isinstance(cmd, ShutdownAllCommand):
-                _ts = now_ts()
-                if gs.pause_until is None:
-                    for _n, _t in gs.timers.items():
-                        if _t.remaining_on_personal_pause is None:
-                            if _t.last_accounted_at > 0 and _t.last_accounted_at < _ts:
-                                _accumulate_stats(gs, _n, _t.mode, _ts - _t.last_accounted_at)
-                gs.timers.clear()
-                gs.breaks.clear()
-                gs.recurring_breaks.clear()
-                gs.pause_until              = None
-                gs.pinned_voice_channel_id  = None
-                gs.last_voice_channel_id    = None
-                gs.voice_notice_sent        = False
-                _save()
+                replies.append(timer_service.shutdown_all(gs))
                 task = guild_tasks.pop(gid, None)
                 if task:
                     task.cancel()
                 _cancel_voice_worker(gid)
                 asyncio.create_task(ensure_voice_disconnected(gid))
                 asyncio.create_task(update_status_panel(gid))
-                replies.append("✅ 전체 종료: 모든 타이머/쉬는시간 중지")
 
             # ── 쉬는시간 강제 종료 ──
             elif isinstance(cmd, BreakEndCommand):
-                if gs.pause_until is None:
-                    replies.append("ℹ️ 현재 일시정지 중이 아닙니다")
-                else:
-                    gs.pause_until = None
-                    for t in gs.timers.values():
-                        timer_resume(t)
+                reply, should_notify = break_service.break_end(gs)
+                if reply:
+                    replies.append(reply)
+                if should_notify:
                     await notify_resume(gid, gs)
                     asyncio.create_task(update_status_panel(gid))
 
@@ -1144,122 +1079,61 @@ async def on_message(msg: discord.Message) -> None:
 
             # ── 종료 ──
             elif isinstance(cmd, StopTimerCommand):
-                name = cmd.name
-                if name in gs.timers:
-                    _st = gs.timers[name]
-                    if gs.pause_until is None and _st.remaining_on_personal_pause is None:
-                        if _st.last_accounted_at > 0:
-                            _accumulate_stats(gs, name, _st.mode, now_ts() - _st.last_accounted_at)
-                    del gs.timers[name]
-                    _save()
-                    replies.append(f"✅ **{name}** 타이머 종료")
+                reply, removed, state_empty = timer_service.stop_timer(gs, cmd.name)
+                replies.append(reply)
+                if removed:
                     asyncio.create_task(update_status_panel(gid))
-                    if not gs.state_exists():
+                    if state_empty:
                         _cancel_voice_worker(gid)
                         asyncio.create_task(ensure_voice_disconnected(gid))
-                else:
-                    replies.append(f"❌ **{name}** 타이머 없음")
 
             # ── 쉬는시간 등록 ──
             elif isinstance(cmd, AddBreakCommand):
-                brk = BreakEntry(
-                    label=cmd.label,
-                    hhmm=cmd.hhmm,
-                    duration_sec=cmd.duration_sec,
-                    next_ts=next_occurrence_ts(cmd.hhmm),
-                )
-                gs.breaks.append(brk)
-                _save()
-                ndt = datetime.fromtimestamp(brk.next_ts, tz=KST)
                 replies.append(
-                    f"✅ 쉬는시간 **{cmd.label}** 등록 "
-                    f"— {ndt.strftime('%m/%d %H:%M')} ({fmt_dur(cmd.duration_sec)})"
+                    break_service.add_break(gs, cmd.label, cmd.hhmm, cmd.duration_sec)
                 )
                 ensure_scheduler(gid)
                 asyncio.create_task(update_status_panel(gid))
 
             # ── 쉬는시간 목록 ──
             elif isinstance(cmd, BreakListCommand):
-                if gs.breaks:
-                    lines = ["**🔔 쉬는시간 목록**"]
-                    for idx, b in enumerate(gs.breaks, 1):
-                        nts = b.next_ts or next_occurrence_ts(b.hhmm)
-                        ndt = datetime.fromtimestamp(nts, tz=KST)
-                        lines.append(
-                            f"  {idx}. **{b.label}** {b.hhmm} "
-                            f"({fmt_dur(b.duration_sec)}) "
-                            f"→ 다음: {ndt.strftime('%m/%d %H:%M')}"
-                        )
-                    replies.append("\n".join(lines))
-                else:
-                    replies.append("🔔 등록된 쉬는시간이 없습니다.")
+                replies.append(break_service.list_breaks(gs))
 
             # ── 쉬는시간 삭제 ──
             elif isinstance(cmd, BreakDeleteCommand):
-                label = cmd.label
-                before = len(gs.breaks)
-                gs.breaks = [b for b in gs.breaks if b.label != label]
-                removed = before - len(gs.breaks)
+                reply, removed, state_empty = break_service.delete_break(gs, cmd.label)
+                replies.append(reply)
                 if removed:
-                    _save()
-                    replies.append(f"✅ 쉬는시간 **{label}** 삭제 ({removed}건)")
                     asyncio.create_task(update_status_panel(gid))
-                    if not gs.state_exists():
+                    if state_empty:
                         _cancel_voice_worker(gid)
                         asyncio.create_task(ensure_voice_disconnected(gid))
-                else:
-                    replies.append(f"❌ **{label}** 쉬는시간을 찾을 수 없습니다.")
 
             # ── 정규쉬는시간 추가 ──
             elif isinstance(cmd, RecurringBreakAddCommand):
-                brk = BreakEntry(
-                    label=cmd.label,
-                    hhmm=cmd.hhmm,
-                    duration_sec=cmd.duration_sec,
-                    next_ts=next_occurrence_ts(cmd.hhmm),
-                )
-                gs.recurring_breaks.append(brk)
-                _save()
-                ndt = datetime.fromtimestamp(brk.next_ts, tz=KST)
                 replies.append(
-                    f"✅ 정규쉬는시간 **{cmd.label}** 등록 "
-                    f"— 매일 {cmd.hhmm} ({fmt_dur(cmd.duration_sec)}) "
-                    f"→ 다음: {ndt.strftime('%m/%d %H:%M')}"
+                    break_service.add_recurring_break(
+                        gs, cmd.label, cmd.hhmm, cmd.duration_sec,
+                    )
                 )
                 ensure_scheduler(gid)
                 asyncio.create_task(update_status_panel(gid))
 
             # ── 정규쉬는시간 목록 ──
             elif isinstance(cmd, RecurringBreakListCommand):
-                if gs.recurring_breaks:
-                    lines = ["**🔁 정규쉬는시간 목록**"]
-                    for idx, b in enumerate(gs.recurring_breaks, 1):
-                        nts = b.next_ts or next_occurrence_ts(b.hhmm)
-                        ndt = datetime.fromtimestamp(nts, tz=KST)
-                        lines.append(
-                            f"  {idx}. **{b.label}** 매일 {b.hhmm} "
-                            f"({fmt_dur(b.duration_sec)}) "
-                            f"→ 다음: {ndt.strftime('%m/%d %H:%M')}"
-                        )
-                    replies.append("\n".join(lines))
-                else:
-                    replies.append("🔁 등록된 정규쉬는시간이 없습니다.")
+                replies.append(break_service.list_recurring_breaks(gs))
 
             # ── 정규쉬는시간 삭제 ──
             elif isinstance(cmd, RecurringBreakDeleteCommand):
-                label = cmd.label
-                before = len(gs.recurring_breaks)
-                gs.recurring_breaks = [b for b in gs.recurring_breaks if b.label != label]
-                removed = before - len(gs.recurring_breaks)
+                reply, removed, state_empty = break_service.delete_recurring_break(
+                    gs, cmd.label,
+                )
+                replies.append(reply)
                 if removed:
-                    _save()
-                    replies.append(f"✅ 정규쉬는시간 **{label}** 삭제 ({removed}건)")
                     asyncio.create_task(update_status_panel(gid))
-                    if not gs.state_exists():
+                    if state_empty:
                         _cancel_voice_worker(gid)
                         asyncio.create_task(ensure_voice_disconnected(gid))
-                else:
-                    replies.append(f"❌ **{label}** 정규쉬는시간을 찾을 수 없습니다.")
 
             # ── 프리셋 저장 ──
             elif isinstance(cmd, PresetSaveCommand):
@@ -1300,115 +1174,35 @@ async def on_message(msg: discord.Message) -> None:
 
             # ── 개인 일시정지 ──
             elif isinstance(cmd, PersonalPauseCommand):
-                name = cmd.name
-                t = gs.timers.get(name)
-                if t is None:
-                    replies.append(f"❌ **{name}** 타이머 없음")
-                elif t.remaining_on_personal_pause is not None:
-                    replies.append(f"ℹ️ **{name}** 이미 일시정지 중입니다.")
-                else:
-                    if gs.pause_until is None:
-                        if t.last_accounted_at > 0:
-                            _accumulate_stats(gs, name, t.mode, now_ts() - t.last_accounted_at)
-                        t.last_accounted_at = now_ts()
-                    timer_personal_pause(t, gs)
-                    replies.append(
-                        f"⏸️ **{name}** 일시정지 "
-                        f"(남은 시간 {fmt_mm_ss(t.remaining_on_personal_pause)} 저장)"
-                    )
+                reply, changed = timer_service.do_personal_pause(gs, cmd.name)
+                replies.append(reply)
+                if changed:
                     asyncio.create_task(update_status_panel(gid))
 
             # ── 개인 재개 ──
             elif isinstance(cmd, PersonalResumeCommand):
-                name = cmd.name
-                t = gs.timers.get(name)
-                if t is None:
-                    replies.append(f"❌ **{name}** 타이머 없음")
-                elif t.remaining_on_personal_pause is None:
-                    replies.append(f"ℹ️ **{name}** 일시정지 상태가 아닙니다.")
-                else:
-                    timer_personal_resume(t, gs)
-                    t.last_accounted_at = now_ts()
-                    if gs.pause_until is not None:
-                        replies.append(
-                            f"▶️ **{name}** 개인 일시정지 해제 "
-                            f"(전체 쉬는시간 종료 후 재개됩니다)"
-                        )
-                    else:
-                        edt = datetime.fromtimestamp(t.phase_end_at, tz=KST)
-                        replies.append(
-                            f"▶️ **{name}** 재개 → {edt.strftime('%H:%M:%S')}"
-                        )
+                reply, changed = timer_service.do_personal_resume(gs, cmd.name)
+                replies.append(reply)
+                if changed:
                     asyncio.create_task(update_status_panel(gid))
 
             # ── 남은시간 수정 ──
             elif isinstance(cmd, SetRemainingCommand):
-                name = cmd.name
-                new_sec = cmd.seconds
-                t = gs.timers.get(name)
-                if t is None:
-                    replies.append(f"❌ **{name}** 타이머 없음")
-                else:
-                    if t.remaining_on_personal_pause is not None:
-                        t.remaining_on_personal_pause = float(new_sec)
-                        replies.append(
-                            f"✅ **{name}** 남은시간 → {fmt_dur(new_sec)} (개인 일시정지 중)"
-                        )
-                    elif t.remaining_on_pause is not None:
-                        t.remaining_on_pause = float(new_sec)
-                        replies.append(
-                            f"✅ **{name}** 남은시간 → {fmt_dur(new_sec)} (전체 일시정지 중)"
-                        )
-                    else:
-                        t.phase_end_at = now_ts() + new_sec
-                        edt = datetime.fromtimestamp(t.phase_end_at, tz=KST)
-                        replies.append(
-                            f"✅ **{name}** 남은시간 → {fmt_dur(new_sec)} "
-                            f"(전환 {edt.strftime('%H:%M:%S')})"
-                        )
+                reply, changed = timer_service.do_set_remaining(
+                    gs, cmd.name, cmd.seconds,
+                )
+                replies.append(reply)
+                if changed:
                     asyncio.create_task(update_status_panel(gid))
 
             # ── 개인 타이머 시작/재설정 ──
             elif isinstance(cmd, SetTimerCommand):
-                ts_now = now_ts()
-                _as_ts = None
-                if cmd.auto_stop_hhmm:
-                    _now = datetime.now(KST)
-                    _h, _m = map(int, cmd.auto_stop_hhmm.split(":"))
-                    _as_ts = _now.replace(hour=_h, minute=_m, second=0, microsecond=0).timestamp()
-                entry = Timer(
-                    study_sec=cmd.study_sec,
-                    rest_sec=cmd.rest_sec,
-                    channel_id=cid,
-                    mode="study",
-                    phase_end_at=ts_now + cmd.study_sec,
-                    auto_stop_cycles=cmd.auto_stop_cycles,
-                    auto_stop_ts=_as_ts,
-                    last_accounted_at=ts_now,
+                replies.append(
+                    timer_service.set_timer(
+                        gs, cmd.name, cmd.study_sec, cmd.rest_sec,
+                        cid, cmd.auto_stop_cycles, cmd.auto_stop_hhmm,
+                    )
                 )
-                if gs.pause_until is not None:
-                    timer_pause(entry)
-                gs.timers[cmd.name] = entry
-                _save()
-                suffix = ""
-                if cmd.auto_stop_cycles:
-                    suffix += f" | {cmd.auto_stop_cycles}회 반복"
-                if cmd.auto_stop_hhmm:
-                    suffix += f" | 오늘 {cmd.auto_stop_hhmm} 종료"
-                if gs.pause_until is not None:
-                    replies.append(
-                        f"✅ **{cmd.name}** 타이머 등록 (현재 일시정지 중 — 재개 후 공부 시작) "
-                        f"공부 {cmd.study_sec // 60}분 / 휴식 {cmd.rest_sec // 60}분"
-                        + suffix
-                    )
-                else:
-                    edt = datetime.fromtimestamp(entry.phase_end_at, tz=KST)
-                    replies.append(
-                        f"✅ **{cmd.name}** 타이머 시작 "
-                        f"— 공부 {cmd.study_sec // 60}분 / 휴식 {cmd.rest_sec // 60}분, "
-                        f"첫 전환 {edt.strftime('%H:%M:%S')}"
-                        + suffix
-                    )
                 ensure_scheduler(gid)
                 asyncio.create_task(update_status_panel(gid))
 
