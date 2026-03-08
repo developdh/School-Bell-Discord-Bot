@@ -89,9 +89,19 @@ async def _get_tts_path_keyed(sentence: str, cache_key: str) -> Path | None:
 
 # ── Voice ─────────────────────────────────────────────────────────────────────
 
+import time as _time
+
+_voice_fail_until: dict[int, float] = {}   # gid → monotonic 재시도 허용 시각
+_voice_connect_locks: dict[int, asyncio.Lock] = {}  # gid → 동시 연결 방지 락
+
 async def ensure_voice_connected(gid: int, gs: GuildState) -> discord.VoiceClient | None:
     vc_id = gs.last_voice_channel_id
     if not vc_id:
+        return None
+
+    # 쿨다운 체크
+    if _time.monotonic() < _voice_fail_until.get(gid, 0):
+        log.debug("음성 연결 쿨다운 중 guild=%d", gid)
         return None
 
     vc_channel = bot.get_channel(vc_id)
@@ -99,6 +109,7 @@ async def ensure_voice_connected(gid: int, gs: GuildState) -> discord.VoiceClien
         log.warning("음성채널 채널 객체 없음 gid=%d cid=%d", gid, vc_id)
         return None
 
+    # 이미 연결된 클라이언트 재활용
     existing = discord.utils.get(bot.voice_clients, guild=vc_channel.guild)
     if existing and existing.is_connected():
         if existing.channel.id != vc_id:
@@ -109,15 +120,42 @@ async def ensure_voice_connected(gid: int, gs: GuildState) -> discord.VoiceClien
                 log.exception("음성채널 이동 실패 guild=%d", gid)
         return existing  # type: ignore[return-value]
 
-    try:
-        vc = await vc_channel.connect(timeout=10.0)
-        log.info("음성채널 연결 guild=%d ch=%d", gid, vc_id)
-        return vc
-    except discord.ClientException:
-        return discord.utils.get(bot.voice_clients, guild=vc_channel.guild)  # type: ignore[return-value]
-    except Exception:
-        log.exception("음성채널 연결 실패 guild=%d", gid)
+    # 동시 연결 시도 방지
+    lock = _voice_connect_locks.setdefault(gid, asyncio.Lock())
+    if lock.locked():
+        log.debug("음성 연결 진행 중, 스킵 guild=%d", gid)
         return None
+
+    async with lock:
+        # 락 획득 후 다시 쿨다운 확인
+        if _time.monotonic() < _voice_fail_until.get(gid, 0):
+            return None
+
+        # 이미 연결되었는지 다시 확인 (락 대기 중 다른 곳에서 연결했을 수 있음)
+        existing = discord.utils.get(bot.voice_clients, guild=vc_channel.guild)
+        if existing and existing.is_connected():
+            return existing  # type: ignore[return-value]
+
+        # 끊어진 voice client 정리
+        if existing:
+            log.info("끊어진 voice client 정리 guild=%d", gid)
+            try:
+                await existing.disconnect(force=True)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+        try:
+            vc = await vc_channel.connect(timeout=15.0, reconnect=False)
+            log.info("음성채널 연결 guild=%d ch=%d", gid, vc_id)
+            _voice_fail_until.pop(gid, None)
+            return vc
+        except discord.ClientException:
+            return discord.utils.get(bot.voice_clients, guild=vc_channel.guild)  # type: ignore[return-value]
+        except Exception:
+            log.warning("음성채널 연결 실패 guild=%d (30초 후 재시도)", gid)
+            _voice_fail_until[gid] = _time.monotonic() + 30
+            return None
 
 
 async def ensure_voice_disconnected(gid: int) -> None:
@@ -190,6 +228,13 @@ async def _voice_worker(gid: int) -> None:
                 vc = await ensure_voice_connected(gid, gs)
                 if vc is None:
                     log.debug("음성 연결 불가, 오디오 스킵 guild=%d", gid)
+                    # 연결 실패 시 큐에 남은 아이템도 버림 (재시도 폭풍 방지)
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                            q.task_done()
+                        except asyncio.QueueEmpty:
+                            break
                     continue
 
                 for bell in (_BASE_DIR / "bell.mp3", _BASE_DIR / "bell.wav"):
